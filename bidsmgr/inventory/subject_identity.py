@@ -82,43 +82,34 @@ def detect_placeholders(tuples: Iterable[IdentityTuple]) -> set[tuple[int, str]]
     tuples_list = list(tuples)
     placeholders: set[tuple[int, str]] = set()
 
-    # First pass — well-known anonymisation tokens, regardless of cardinality.
+    # Pass 1 — well-known anonymisation tokens (case-insensitive, also
+    # matches token prefixes like ``ANON-001``). Catches the common
+    # de-identifier strings regardless of cardinality.
     for fi in range(len(_FIELD_NAMES)):
         for t in tuples_list:
             v = t[fi]
             if v and _looks_like_placeholder_token(v):
                 placeholders.add((fi, v))
 
-    # Second pass — values that appear in 2+ tuples and pass the
-    # "no other consistent identifier" test. Any field already in
-    # ``placeholders`` is excluded when checking for a real shared
-    # identifier (otherwise the heuristic gets fooled when two
-    # placeholder fields co-occur).
-    for fi in range(len(_FIELD_NAMES)):
-        by_value: dict[str, list[IdentityTuple]] = defaultdict(list)
-        for t in tuples_list:
-            v = t[fi]
-            if v:
-                by_value[v].append(t)
-        for value, group in by_value.items():
-            if (fi, value) in placeholders:
-                continue
-            if len(group) < 2:
-                continue
-            shares_other_real = False
-            for fj in range(len(_FIELD_NAMES)):
-                if fj == fi:
-                    continue
-                other_values = {t[fj] for t in group if t[fj]}
-                if len(other_values) != 1:
-                    continue
-                only_value = next(iter(other_values))
-                if (fj, only_value) in placeholders:
-                    continue
-                shares_other_real = True
-                break
-            if not shares_other_real:
-                placeholders.add((fi, value))
+    # Pass 2 — universal-coverage rule. With 3+ identity tuples, a value
+    # that appears in EVERY tuple of a given field is almost certainly an
+    # operator-stamped constant (e.g. ``StudyDescription = "PHANTOM"``
+    # across all rows). This is conservative enough not to flag values
+    # like ``XX00XX00`` that appear in some-but-not-all tuples — those
+    # are the real shared identifiers we WANT to use for linking
+    # (operator pasted a folder label into PID/FamilyName but the
+    # GivenName carries the real anonymised subject hash).
+    n = len(tuples_list)
+    if n >= 3:
+        for fi in range(len(_FIELD_NAMES)):
+            by_value: dict[str, int] = defaultdict(int)
+            for t in tuples_list:
+                v = t[fi]
+                if v:
+                    by_value[v] += 1
+            for value, count in by_value.items():
+                if count == n and (fi, value) not in placeholders:
+                    placeholders.add((fi, value))
 
     return placeholders
 

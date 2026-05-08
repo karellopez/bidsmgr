@@ -125,6 +125,55 @@ def test_three_disjoint_records_share_double_placeholder_and_split():
     assert len(_bucket(clusters)) == 3
 
 
+def test_neuroimaging_unit_new_shape_consistent_given_links_visits():
+    """Real shape: operator stamps folder labels into PID and FamilyName
+    so they look like distinct identifiers, but the GivenName carries the
+    real anonymised subject hash. Two tuples sharing only the GivenName
+    must merge; the third tuple with a different GivenName stays split.
+
+    This is the case the cardinality-only heuristic got wrong. The fix
+    is to drop cardinality detection at < 100% coverage and rely on the
+    hardcoded token list + universal coverage instead.
+    """
+    a = normalize_tuple("OL_0001", "XX00XX00", "OL_0001")
+    b = normalize_tuple("OL_0002", "XX00XX00", "OL_0002")
+    c = normalize_tuple("OL_0003", "XX00XX22", "OL_0003")
+    clusters = cluster_subjects({a, b, c})
+    bucket = _bucket(clusters)
+    assert frozenset({a, b}) in bucket
+    assert frozenset({c}) in bucket
+    assert len(bucket) == 2
+
+
+def test_universal_coverage_value_treated_as_placeholder():
+    """If a value covers EVERY tuple in a field, it's an operator-stamped
+    constant — flag as placeholder so it doesn't fool the union-find."""
+    a = normalize_tuple("PAT-1", "Alice", "STUDYNAME")
+    b = normalize_tuple("PAT-2", "Bob", "STUDYNAME")
+    c = normalize_tuple("PAT-3", "Carol", "STUDYNAME")
+    placeholders = detect_placeholders({a, b, c})
+    # FamilyName index is 2 — STUDYNAME covers 3/3.
+    assert (2, "STUDYNAME") in placeholders
+    clusters = cluster_subjects({a, b, c})
+    assert len(_bucket(clusters)) == 3
+
+
+def test_partial_coverage_value_NOT_treated_as_placeholder():
+    """A value that covers only 2 of 3 tuples is more likely a real shared
+    identifier (visits of one person within a multi-person dataset)."""
+    a = normalize_tuple("PID-1", "Alice", "Smith")
+    b = normalize_tuple("PID-2", "Alice", "Smith")  # same person, different anonymized PID
+    c = normalize_tuple("PID-3", "Carol", "Jones")
+    placeholders = detect_placeholders({a, b, c})
+    # "Alice" / "Smith" cover 2/3 — not flagged as placeholders.
+    assert (1, "Alice") not in placeholders
+    assert (2, "Smith") not in placeholders
+    clusters = cluster_subjects({a, b, c})
+    bucket = _bucket(clusters)
+    assert frozenset({a, b}) in bucket
+    assert frozenset({c}) in bucket
+
+
 def test_tuple_normalization_strips_whitespace():
     a = normalize_tuple("  101174  ", "John ", " Smith")
     assert a == ("101174", "John", "Smith")
