@@ -1,0 +1,716 @@
+"""``bidsmgr-scan`` — scan DICOMs, classify, write TSV.
+
+Orchestration is explicit code (architecture.md §12 rule 3 — no Pipeline).
+
+Pipeline:
+
+1. ``inventory.mri_dicom.scan_dicoms_long`` produces the v0.2.5 22-column
+   DataFrame, with ``proposed_*`` columns blank and ``modality`` filled
+   by the legacy regex dictionary.
+2. Build :class:`InventoryRow` objects per DataFrame row, group by source
+   folder, and run :func:`classifier.dcm2niix_bidsguess.classify` to
+   produce :class:`Classification` records.
+3. Run :func:`classifier.sequence_dict.classify` as a fallback for rows
+   that BidsGuess didn't fire on (or that BidsGuess produced a
+   schema-invalid result for).
+4. Strip any ``run`` entity from every classification (BIDS-semantic
+   ``run`` is cross-row; the value dcm2niix puts there is DICOM
+   SeriesNumber, which is meaningless for BIDS).
+5. Group by ``(subject, session, datatype, suffix, other-entities)``
+   within each subject+session; assign ``run-1, run-2, …`` only to groups
+   with more than one row, ordered by acquisition time. Singletons get no
+   run entity.
+6. Emit ``proposed_datatype`` / ``proposed_basename`` / ``Proposed BIDS name``
+   for every classified row (best effort — even when the schema would
+   reject it). ``proposed_issues`` records any required-entity / format
+   violations so the GUI / planner can prompt the user.
+7. Write the TSV.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re as _re
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Iterable, Optional
+
+import pandas as pd
+
+from .. import schema
+from ..classifier import dcm2niix_bidsguess, sequence_dict
+from ..classifier.types import Classification
+from ..inventory.mri_dicom import EXTENDED_COLUMNS, TSV_COLUMNS, scan_dicoms_long
+from ..inventory.types import InventoryRow
+
+log = logging.getLogger(__name__)
+
+
+# Columns appended after the v0.2.5 22-col contract.
+BIDS_GUESS_COLUMNS: tuple[str, ...] = (
+    "bids_guess_classifier",
+    "bids_guess_datatype",
+    "bids_guess_suffix",
+    "bids_guess_entities",
+    "bids_guess_confidence",
+    "bids_guess_skip",
+    "proposed_issues",
+    "repetition_type",
+)
+
+
+# Heuristic thresholds for distinguishing planned repeats from operator
+# redos. Tuned against real Siemens Prisma fMRI data.
+#
+# ``REDO_WINDOW_S`` — two acquisitions with the SAME ``SeriesDescription``
+# AND same ``image_type``, with no design marker in the name, falling
+# within this many seconds of each other are treated as
+# operator-restart-after-quick-check (the technician saw blur/motion and
+# recorded again). The earlier one is flagged ``suspected_abort``.
+#
+# ``ABORT_MIN_FILES`` — both sides of an abort pair must have at least
+# this many DICOM files. This prevents the heuristic from flagging a
+# tiny derivative output (e.g. 1-file Phoenix mosaic) as a "redo" of its
+# 200-file actual-acquisition companion.
+#
+# ``TRIVIAL_MAX_FILES`` and ``TRIVIAL_RATIO`` — a row is flagged
+# ``trivial`` (likely a derivative of another series) when its file
+# count is at most ``TRIVIAL_MAX_FILES`` AND there exists a same-name
+# companion in the same group with at least ``TRIVIAL_RATIO`` times more
+# files. SBRef and other genuinely-small but standalone series stay
+# ``planned`` because they have no much-larger same-name companion.
+REDO_WINDOW_S: int = 300
+ABORT_MIN_FILES: int = 10
+TRIVIAL_MAX_FILES: int = 2
+TRIVIAL_RATIO: int = 10
+
+
+_DESIGN_MARKER_RE = _re.compile(
+    r"(?:^|[_-])(?:run|split|part)-?\d+", _re.IGNORECASE
+)
+
+
+def _has_design_marker(seq_desc: Optional[str]) -> bool:
+    """True when the SeriesDescription encodes a design-level repetition.
+
+    Operators who type ``run-01`` / ``run-02`` / ``split-01`` etc. into the
+    sequence name are explicitly signalling planned repeats. Trust them —
+    the abort detector skips groups that have any design-marked member.
+    """
+    if not seq_desc:
+        return False
+    return bool(_DESIGN_MARKER_RE.search(seq_desc))
+
+
+# ---------------------------------------------------------------------------
+# Step 2 + 3 — building rows and running the classifier chain
+# ---------------------------------------------------------------------------
+
+
+def _rows_from_dataframe(df: pd.DataFrame) -> list[InventoryRow]:
+    """Build :class:`InventoryRow` objects from the inventory DataFrame.
+
+    The fmap-collapse step joins multiple SeriesInstanceUIDs with ``|``;
+    we expand those so each underlying UID becomes its own InventoryRow.
+    The classifier still maps results back via ``series_uid``.
+    """
+
+    rows: list[InventoryRow] = []
+    for _idx, r in df.iterrows():
+        source_dir = r.get("_source_dir") or ""
+        if not source_dir:
+            continue
+        uids_field = str(r.get("series_uid") or "")
+        bids_name = str(r.get("BIDS_name") or "").replace("sub-", "") or None
+        session = str(r.get("session") or "").replace("ses-", "") or None
+        for uid in (u for u in uids_field.split("|") if u):
+            rows.append(
+                InventoryRow(
+                    modality="mri",
+                    source=Path(source_dir),
+                    series_uid=uid,
+                    series_description=str(r.get("sequence") or ""),
+                    subject_hint=bids_name,
+                    session_hint=session,
+                    n_files=int(r.get("n_files") or 0),
+                    acq_time=str(r.get("acq_time") or "") or None,
+                    fine_modality=str(r.get("modality") or "") or None,
+                    image_type=str(r.get("image_type") or "") or None,
+                    raw_metadata={
+                        "source_folder": str(r.get("source_folder") or ""),
+                        "df_index": _idx,
+                    },
+                )
+            )
+    return rows
+
+
+def _is_classification_schema_valid(c: Classification) -> bool:
+    """Return ``True`` if (datatype, suffix, candidate_entities) round-trips through the schema."""
+    if c.skip or c.datatype == "discard":
+        return True  # treated as a "no-emit" decision; doesn't need to be valid
+    if c.datatype not in schema.list_datatypes():
+        return False
+    if c.suffix not in schema.list_suffixes(c.datatype):
+        return False
+    # Validate the candidate entities (subject is filled later by cli/scan).
+    test_entities = {"subject": "001", **c.candidate_entities}
+    verdicts = schema.validate_entity_set(test_entities, c.datatype, c.suffix)
+    return not [v for v in verdicts if v.severity is schema.Severity.ERROR]
+
+
+def _run_classifier_chain(rows: list[InventoryRow]) -> dict[str, Classification]:
+    """Run the BidsGuess classifier first; fall back to sequence_dict.
+
+    Returns a mapping ``row_id (hex) -> Classification``. Each row gets at
+    most one classification — the highest-confidence schema-valid result,
+    or the sequence_dict fallback if BidsGuess produced nothing usable.
+    """
+
+    # Layer 1 — dcm2niix BidsGuess.
+    try:
+        bg_results = dcm2niix_bidsguess.classify(rows)
+    except FileNotFoundError as exc:
+        log.warning("BidsGuess skipped: %s", exc)
+        bg_results = []
+
+    chosen: dict[str, Classification] = {}
+    for c in bg_results:
+        if not _is_classification_schema_valid(c):
+            log.debug("BidsGuess result rejected by schema: %s", c)
+            continue
+        key = c.row_id.hex
+        existing = chosen.get(key)
+        if existing is None or c.confidence > existing.confidence:
+            chosen[key] = c
+
+    # Layer 3 — legacy regex/sequence-dictionary classifier.
+    needs_fallback = [r for r in rows if r.row_id.hex not in chosen]
+    fb_results = sequence_dict.classify(needs_fallback)
+    for c in fb_results:
+        chosen.setdefault(c.row_id.hex, c)
+
+    return chosen
+
+
+# ---------------------------------------------------------------------------
+# Step 4 + 5 — run normalization
+# ---------------------------------------------------------------------------
+
+
+def _entity_signature(entities: dict[str, str]) -> tuple[tuple[str, str], ...]:
+    """Stable, hashable representation of an entity dict (excluding ``run``)."""
+    return tuple(sorted((k, str(v)) for k, v in entities.items() if k != "run"))
+
+
+_RUN_HINT_RE = _re.compile(r"(?:^|[_-])run-?0*(\d+)", _re.IGNORECASE)
+
+
+def _run_hint_from_sequence(text: Optional[str]) -> Optional[int]:
+    """Extract the operator-supplied run number from a sequence description, if any."""
+    if not text:
+        return None
+    m = _RUN_HINT_RE.search(text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _parse_dicom_time_seconds(text: Optional[str]) -> Optional[float]:
+    """Convert DICOM TM (``HHMMSS.FFFFFF``) to seconds-since-midnight."""
+    if not text:
+        return None
+    s = text.strip()
+    if not s:
+        return None
+    try:
+        if "." in s:
+            base, frac = s.split(".", 1)
+        else:
+            base, frac = s, "0"
+        if len(base) < 6:
+            base = base.ljust(6, "0")
+        h = int(base[0:2])
+        m = int(base[2:4])
+        sec = int(base[4:6])
+        return h * 3600 + m * 60 + sec + float("0." + frac)
+    except (ValueError, IndexError):
+        return None
+
+
+def _detect_aborts(
+    rows: list[InventoryRow],
+    chosen: dict[str, Classification],
+    *,
+    redo_window_s: int = REDO_WINDOW_S,
+    abort_min_files: int = ABORT_MIN_FILES,
+    trivial_max_files: int = TRIVIAL_MAX_FILES,
+    trivial_ratio: int = TRIVIAL_RATIO,
+) -> dict[str, str]:
+    """Heuristically separate planned repeats from operator-redo aborts.
+
+    Returns ``row_id_hex -> verdict`` where verdict is one of:
+
+    * ``"isolated"`` — singleton group; no repetition.
+    * ``"trivial"`` — ``n_files <= trivial_threshold``. Almost always a
+      derivative output (Phoenix mosaic, MoCo summary, scout reformat).
+      Excluded from abort pairing.
+    * ``"planned"`` — repeat is intentional; either the operator encoded a
+      design marker (``run-N`` / ``split-N`` / ``part-N``) in the sequence
+      name, or the same-name companion is far enough away in time to be a
+      separate planned attempt.
+    * ``"suspected_abort"`` — same-name + same-image_type companion sits
+      within ``redo_window_s`` later, with neither side trivial and no
+      design marker in the name. Operator likely saw blur/motion on a quick
+      check and re-recorded; the EARLIER attempt is flagged.
+
+    Three signals that prevent the most common false positives:
+
+    1. Design markers in the SeriesDescription → trust the operator.
+    2. ``image_type`` mismatch → magnitude/phase/derived siblings of one
+       acquisition (NOT aborts).
+    3. ``trivial_threshold`` — 1-file Phoenix mosaics co-exist alongside
+       full acquisitions of the same name; they're not redos.
+    """
+
+    rows_by_id = {r.row_id.hex: r for r in rows}
+
+    groups: dict[tuple, list[str]] = defaultdict(list)
+    for row_key, c in chosen.items():
+        if c.skip:
+            continue
+        row = rows_by_id.get(row_key)
+        if row is None:
+            continue
+        sig = _entity_signature(c.candidate_entities)
+        gk = (
+            row.subject_hint or "",
+            row.session_hint or "",
+            c.datatype,
+            c.suffix,
+            sig,
+        )
+        groups[gk].append(row_key)
+
+    verdicts: dict[str, str] = {}
+
+    # Pass 1 — base verdict (isolated for singletons, planned for the rest).
+    for gk, members in groups.items():
+        for k in members:
+            verdicts[k] = "isolated" if len(members) == 1 else "planned"
+
+    # Pass 2 — trivial detection. A row is trivial only when it's tiny
+    # (``trivial_max_files``) AND another row in the same group with the
+    # SAME SeriesDescription has at least ``trivial_ratio``× more files.
+    # This isolates "1-file Phoenix mosaic next to 132-file actual run"
+    # without false-positively catching standalone short series like SBRef.
+    for gk, members in groups.items():
+        if len(members) < 2:
+            continue
+        for k in members:
+            row = rows_by_id[k]
+            n = row.n_files or 0
+            if not (0 < n <= trivial_max_files):
+                continue
+            same_name = (row.series_description or "").strip()
+            for k2 in members:
+                if k2 == k:
+                    continue
+                r2 = rows_by_id[k2]
+                if (r2.series_description or "").strip() != same_name:
+                    continue
+                if (r2.n_files or 0) >= n * trivial_ratio:
+                    verdicts[k] = "trivial"
+                    break
+
+    # Pass 3 — within each same-params group, look for redo clusters.
+    for gk, members in groups.items():
+        if len(members) < 2:
+            continue
+        # Cluster by (SeriesDescription, image_type). Siblings of one
+        # acquisition typically differ in image_type (M / P / ND), so this
+        # composite key isolates genuine redos of the same physical
+        # acquisition from magnitude/phase pairs.
+        by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for k in members:
+            row = rows_by_id[k]
+            name = (row.series_description or "").strip()
+            img = (row.image_type or "").strip()
+            by_key[(name, img)].append(k)
+
+        for (name, _img), name_members in by_key.items():
+            # Trivial outputs sit alongside real acquisitions of the same
+            # name; filter them out before checking for redo pairs so we
+            # only compare real attempts.
+            name_members = [k for k in name_members if verdicts.get(k) != "trivial"]
+            if len(name_members) < 2:
+                continue
+            # Trust operator-encoded design markers.
+            if any(_has_design_marker(rows_by_id[k].series_description) for k in name_members):
+                continue
+
+            sorted_members = sorted(
+                name_members,
+                key=lambda k: (
+                    _parse_dicom_time_seconds(rows_by_id[k].acq_time)
+                    if _parse_dicom_time_seconds(rows_by_id[k].acq_time) is not None
+                    else float("inf"),
+                    rows_by_id[k].series_uid or "",
+                ),
+            )
+
+            for i in range(len(sorted_members) - 1):
+                k_e = sorted_members[i]
+                k_l = sorted_members[i + 1]
+                row_e = rows_by_id[k_e]
+                row_l = rows_by_id[k_l]
+                # Both sides must look like real, complete acquisitions.
+                if (row_e.n_files or 0) < abort_min_files:
+                    continue
+                if (row_l.n_files or 0) < abort_min_files:
+                    continue
+                t_e = _parse_dicom_time_seconds(row_e.acq_time)
+                t_l = _parse_dicom_time_seconds(row_l.acq_time)
+                if t_e is None or t_l is None:
+                    # No timing information: be conservative — only flag if
+                    # there are 3+ same-name same-image_type acquisitions.
+                    if len(sorted_members) >= 3:
+                        verdicts[k_e] = "suspected_abort"
+                    continue
+                gap = t_l - t_e
+                if 0 <= gap <= redo_window_s:
+                    verdicts[k_e] = "suspected_abort"
+
+    return verdicts
+
+
+def _normalize_runs(
+    rows: list[InventoryRow],
+    chosen: dict[str, Classification],
+    abort_verdicts: Optional[dict[str, str]] = None,
+) -> dict[str, Classification]:
+    """Reassign ``run-N`` per BIDS semantic.
+
+    BIDS ``run-<index>`` MUST be used when the same set of acquisition
+    parameters is repeated within a session. We approximate "same parameters"
+    by ``(datatype, suffix, candidate_entities-without-run)`` and group rows
+    within ``(subject, session)``.
+
+    Within a group of size > 1, rows are ordered by:
+
+    1. The operator-supplied run hint embedded in ``SeriesDescription``
+       (e.g. ``task-foo_run-01_bold``) — this is the user's stated intent.
+    2. ``acq_time`` (DICOM AcquisitionTime).
+    3. ``series_uid`` lexicographic (Siemens UIDs are time-encoded).
+    4. ``row_id`` (deterministic fallback).
+
+    Groups of size 1 lose any pre-existing ``run`` entity.
+    """
+
+    rows_by_id = {r.row_id.hex: r for r in rows}
+    abort_verdicts = abort_verdicts or {}
+
+    groups: dict[tuple, list[str]] = defaultdict(list)
+    for row_key, c in chosen.items():
+        if c.skip:
+            c.candidate_entities.pop("run", None)
+            continue
+        # Aborts and trivial derivative outputs are not "planned repeats";
+        # exclude both from run-counting so the surviving planned
+        # acquisitions get clean ``run-1, run-2, …``. The excluded row
+        # keeps no run entity.
+        if abort_verdicts.get(row_key) in {"suspected_abort", "trivial"}:
+            c.candidate_entities.pop("run", None)
+            continue
+        row = rows_by_id.get(row_key)
+        if row is None:
+            continue
+        sig = _entity_signature(c.candidate_entities)
+        group_key = (
+            row.subject_hint or "",
+            row.session_hint or "",
+            c.datatype,
+            c.suffix,
+            sig,
+        )
+        groups[group_key].append(row_key)
+
+    for group_key, member_keys in groups.items():
+        if len(member_keys) <= 1:
+            for k in member_keys:
+                chosen[k].candidate_entities.pop("run", None)
+            continue
+
+        def _sort_key(k: str) -> tuple:
+            row = rows_by_id[k]
+            run_hint = _run_hint_from_sequence(row.series_description)
+            # ``None`` first hint sorts last so explicitly-numbered rows
+            # take precedence over un-numbered ones.
+            return (
+                0 if run_hint is not None else 1,
+                run_hint if run_hint is not None else 0,
+                row.acq_time or "",
+                row.series_uid or "",
+                row.row_id.hex,
+            )
+
+        member_keys.sort(key=_sort_key)
+        for idx, k in enumerate(member_keys, start=1):
+            chosen[k].candidate_entities["run"] = str(idx)
+
+    return chosen
+
+
+# ---------------------------------------------------------------------------
+# Step 6 — proposed names with issues
+# ---------------------------------------------------------------------------
+
+
+def _propose_basename(
+    bids_name: str,
+    session: str,
+    classification: Classification,
+) -> tuple[str, str, list[str]]:
+    """Return ``(datatype, basename, issues)`` for a classification.
+
+    ``issues`` is a list of human-readable validation messages; an empty
+    list means the proposal is schema-valid and ready to commit.
+    Skip / discard rows return empty datatype/basename and no issues.
+    """
+
+    if classification.skip or classification.datatype == "discard":
+        return ("", "", [])
+
+    if not bids_name:
+        return ("", "", ["BIDS_name missing"])
+
+    entities = dict(classification.candidate_entities)
+    entities.pop("subject", None)
+    entities = {"subject": bids_name, **entities}
+    if session:
+        entities["session"] = session
+
+    datatype = classification.datatype
+    suffix = classification.suffix
+
+    # Strip entities the schema doesn't allow for this (datatype, suffix).
+    allowed = set(schema.allowed_entities(datatype, suffix))
+    for ent in list(entities.keys()):
+        if ent != "subject" and ent not in allowed:
+            entities.pop(ent, None)
+
+    verdicts = schema.validate_entity_set(entities, datatype, suffix)
+    errors = [v for v in verdicts if v.severity is schema.Severity.ERROR]
+    issues = [f"{v.rule_id}: {v.message}" for v in errors]
+
+    # Best-effort: emit a basename even if schema-invalid by inserting
+    # placeholder values for required entities so the user gets something
+    # to look at. Placeholders are flagged via ``issues``.
+    if errors:
+        for ent in schema.required_entities(datatype, suffix):
+            if not entities.get(ent):
+                entities[ent] = _placeholder_for_entity(ent)
+
+    try:
+        basename = schema.build_basename(entities, datatype, suffix)
+    except (ValueError, KeyError) as exc:
+        log.debug("could not build basename from %s: %s", classification, exc)
+        return (datatype, "", issues + [f"build_basename: {exc}"])
+
+    return datatype, basename, issues
+
+
+def _placeholder_for_entity(entity: str) -> str:
+    """Schema-format-conforming placeholder used when a required entity is missing."""
+    placeholders = {"task": "TASK", "subject": "TBD"}
+    return placeholders.get(entity, "TBD")
+
+
+# ---------------------------------------------------------------------------
+# DataFrame integration
+# ---------------------------------------------------------------------------
+
+
+def _augment_dataframe(
+    df: pd.DataFrame,
+    rows: list[InventoryRow],
+    chosen: dict[str, Classification],
+    abort_verdicts: Optional[dict[str, str]] = None,
+) -> pd.DataFrame:
+    """Merge classifier output back into the inventory DataFrame.
+
+    The relationship is N rows per DataFrame row (fmap collapse joins UIDs).
+    We pick the *highest-confidence* classification across the underlying
+    UIDs as the proposal for the DataFrame row.
+    """
+
+    abort_verdicts = abort_verdicts or {}
+
+    # Index rows by DataFrame index.
+    rows_by_df_idx: dict[int, list[InventoryRow]] = defaultdict(list)
+    for r in rows:
+        df_idx = r.raw_metadata.get("df_index")
+        if df_idx is not None:
+            rows_by_df_idx[df_idx].append(r)
+
+    for col in BIDS_GUESS_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    for df_idx, group_rows in rows_by_df_idx.items():
+        # Pick best classification for this DataFrame row.
+        candidates = [chosen.get(r.row_id.hex) for r in group_rows]
+        candidates = [c for c in candidates if c is not None]
+        if not candidates:
+            continue
+        best = max(candidates, key=lambda c: c.confidence)
+
+        bids_name = str(df.at[df_idx, "BIDS_name"] or "").replace("sub-", "")
+        session = str(df.at[df_idx, "session"] or "").replace("ses-", "")
+        datatype, basename, issues = _propose_basename(bids_name, session, best)
+
+        # Repetition verdict: "isolated" (singleton group), "trivial"
+        # (sub-derivative output), "planned" (intentional repeat), or
+        # "suspected_abort" (operator-redo). Pick the worst verdict across
+        # underlying rows so a partial-abort surfaces rather than being
+        # hidden by a collapsed pair.
+        verdicts = [abort_verdicts.get(r.row_id.hex, "") for r in group_rows]
+        if "suspected_abort" in verdicts:
+            rep_type = "suspected_abort"
+        elif "planned" in verdicts:
+            rep_type = "planned"
+        elif "trivial" in verdicts:
+            rep_type = "trivial"
+        elif "isolated" in verdicts:
+            rep_type = "isolated"
+        else:
+            rep_type = ""
+
+        df.at[df_idx, "bids_guess_classifier"] = best.classifier
+        df.at[df_idx, "bids_guess_datatype"] = best.datatype
+        df.at[df_idx, "bids_guess_suffix"] = best.suffix
+        df.at[df_idx, "bids_guess_entities"] = json.dumps(best.candidate_entities, sort_keys=True)
+        df.at[df_idx, "bids_guess_confidence"] = best.confidence
+        df.at[df_idx, "bids_guess_skip"] = bool(best.skip)
+        df.at[df_idx, "repetition_type"] = rep_type
+
+        annotated_issues = list(issues)
+        if rep_type == "suspected_abort":
+            annotated_issues.append(
+                "suspected_abort: same SeriesDescription as a later companion "
+                "within the redo window (likely operator restart after a "
+                "noisy / blurry initial attempt)"
+            )
+            df.at[df_idx, "include"] = 0
+        elif rep_type == "trivial":
+            annotated_issues.append(
+                f"trivial: {best.classifier} produced a candidate but the "
+                f"series has very few files — likely a derivative output "
+                f"(Phoenix mosaic / MoCo summary / scout reformat)"
+            )
+            df.at[df_idx, "include"] = 0
+
+        df.at[df_idx, "proposed_issues"] = " | ".join(annotated_issues)
+
+        if best.skip:
+            df.at[df_idx, "include"] = 0
+
+        if basename:
+            ext = ".tsv" if basename.endswith("_physio") else ".nii.gz"
+            df.at[df_idx, "proposed_datatype"] = datatype
+            df.at[df_idx, "proposed_basename"] = basename
+            df.at[df_idx, "Proposed BIDS name"] = f"{datatype}/{basename}{ext}"
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Top-level orchestration
+# ---------------------------------------------------------------------------
+
+
+def run_scan(
+    dicom_root: Path,
+    output_tsv: Path,
+    *,
+    n_jobs: int = 1,
+    skip_bids_guess: bool = False,
+) -> pd.DataFrame:
+    """Run the full scan pipeline and return the DataFrame written to TSV."""
+
+    df = scan_dicoms_long(dicom_root, output_tsv=None, n_jobs=n_jobs)
+
+    if df.empty:
+        log.warning("no DICOMs found under %s", dicom_root)
+        for col in BIDS_GUESS_COLUMNS:
+            df[col] = ""
+        df.to_csv(output_tsv, sep="\t", index=False)
+        return df
+
+    rows = _rows_from_dataframe(df)
+
+    chosen: dict[str, Classification] = {}
+    if skip_bids_guess:
+        # Only run sequence_dict (legacy regex layer).
+        for c in sequence_dict.classify(rows):
+            chosen.setdefault(c.row_id.hex, c)
+    else:
+        chosen = _run_classifier_chain(rows)
+
+    abort_verdicts = _detect_aborts(rows, chosen)
+    chosen = _normalize_runs(rows, chosen, abort_verdicts)
+    df = _augment_dataframe(df, rows, chosen, abort_verdicts)
+
+    df.drop(columns=["_source_dir"], errors="ignore", inplace=True)
+    columns = (
+        [c for c in TSV_COLUMNS if c in df.columns]
+        + [c for c in BIDS_GUESS_COLUMNS if c in df.columns]
+        + [c for c in EXTENDED_COLUMNS if c in df.columns]
+    )
+    df.to_csv(output_tsv, sep="\t", index=False, columns=columns)
+    print(f"Inventory written to: {output_tsv}")
+    return df
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="bidsmgr-scan", description=__doc__.split("\n")[0])
+    parser.add_argument("dicom_root", help="Directory containing DICOM files (any depth)")
+    parser.add_argument("output_tsv", help="Destination TSV file")
+    parser.add_argument(
+        "--jobs", "-j",
+        type=int,
+        default=max(1, round((os.cpu_count() or 1) * 0.8)),
+        help="Number of parallel workers used to read DICOM headers",
+    )
+    parser.add_argument(
+        "--no-bids-guess",
+        action="store_true",
+        help="Skip the dcm2niix BidsGuess classifier and use only the legacy regex layer",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0,
+        help="Increase log verbosity (-v INFO, -vv DEBUG)",
+    )
+
+    args = parser.parse_args(argv)
+    level = logging.WARNING - 10 * min(args.verbose, 2)
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
+
+    run_scan(
+        Path(args.dicom_root),
+        Path(args.output_tsv),
+        n_jobs=args.jobs,
+        skip_bids_guess=args.no_bids_guess,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
