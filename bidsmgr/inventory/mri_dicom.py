@@ -43,6 +43,7 @@ from ..classifier.sequence_dict import (
     modality_to_container,
     normalize_study_name,
 )
+from .subject_identity import IdentityTuple, cluster_subjects, normalize_tuple
 
 
 DICOM_EXTS = (".dcm", ".ima")
@@ -138,19 +139,17 @@ def _read_one(fpath: str, root_dir: Path) -> Optional[dict]:
     )
     study = normalize_study_name(study)
 
-    # Subject identity (architecture.md §4.1).
-    # Primary signal is ``(PatientID, PatientName)``. ``PatientBirthDate`` is
-    # explicitly NOT part of the key because anonymisation pipelines often
-    # blank it on some visits and replace it with a constant on others — that
-    # behaviour incorrectly splits longitudinal subjects (e.g. PPMI patient
-    # 101174 had birthdate="" on visit-1 and "19700101" on visit-2). The
-    # birthdate is still recorded in raw_metadata for the conflict scanner
-    # to surface as a warning when two visits disagree.
-    name_key = f"{given}^{family}".strip("^") if (given or family) else ""
-    identity_key = "||".join((pid, name_key))
+    # Subject identity (architecture.md §4.1) — three-component key
+    # ``pid||given||family``. The actual subject clustering (joining records
+    # that share any non-placeholder field) happens after the parallel scan
+    # in ``scan_dicoms_long`` via
+    # :func:`bidsmgr.inventory.subject_identity.cluster_subjects`.
+    # ``PatientBirthDate`` is intentionally excluded — anonymisation
+    # pipelines mutate it inconsistently across visits.
+    identity_key = "||".join((pid, given, family))
     if not identity_key.strip("|"):
         # Last resort: fall back to ``(subj, study)`` so anonymised datasets
-        # without PatientID don't collapse all rows into one subject.
+        # without ANY identifier don't collapse all rows into one subject.
         identity_key = f"{subj}||{study}"
 
     rel = os.path.relpath(file_root, root_dir)
@@ -278,25 +277,50 @@ def scan_dicoms_long(
     )
     print(f"Unique Series instances   : {total_series}")
 
-    # Assign BIDS subject IDs globally — same physical patient (same
-    # ``identity_key``) gets the same ``sub-NNN`` regardless of how many
-    # different ``StudyDescription`` strings the operator typed across visits.
-    # This is what fixes longitudinal datasets like PPMI where v0.2.5 split
-    # the same patient into N different subjects when ``StudyDescription``
-    # varied across visits.
-    bids_map: dict[str, str] = {}
-    for i, subj_key in enumerate(sorted(demo.keys())):
-        bids_map[subj_key] = f"sub-{i + 1:03d}"
+    # Subject identity clustering (architecture.md §4.1).
+    # The per-record identity key is ``pid||given||family``. Across visits
+    # any of these fields can be inconsistent (anonymisation rewrites,
+    # operator typos, swapped given/family). Build a union-find over the
+    # unique identity tuples: link tuples that share any non-placeholder
+    # field; each connected component becomes one BIDS subject. See
+    # :mod:`bidsmgr.inventory.subject_identity`.
+    identity_to_tuple: dict[str, IdentityTuple] = {}
+    for k in demo:
+        if "||" in k:
+            parts = k.split("||")
+            if len(parts) == 3:
+                identity_to_tuple[k] = normalize_tuple(*parts)
+                continue
+        # Fallback path (no PID/name): treat the raw key as a placeholder PID.
+        identity_to_tuple[k] = normalize_tuple(k, "", "")
 
-    # Per-subject session inference: distinct StudyInstanceUID + StudyDate
-    # tuples become ses-1, ses-2, ... in chronological (StudyDate, StudyTime,
-    # StudyInstanceUID) order. Path-derived ses-X still wins when present.
+    cluster_root_for_tuple = cluster_subjects(set(identity_to_tuple.values()))
+
+    cluster_roots = sorted(set(cluster_root_for_tuple.values()))
+    cluster_to_id: dict[IdentityTuple, str] = {
+        root: f"sub-{i + 1:03d}" for i, root in enumerate(cluster_roots)
+    }
+
+    bids_map: dict[str, str] = {}
+    for k, t in identity_to_tuple.items():
+        bids_map[k] = cluster_to_id[cluster_root_for_tuple[t]]
+
+    # Session inference operates per *cluster* (one physical subject), not
+    # per identity_key. Two visits with different anonymised PatientIDs
+    # that the union-find merged still need to produce ses-1 / ses-2.
+    studies_per_cluster: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
+    for k, study_set in subject_studies.items():
+        bids_id = bids_map.get(k)
+        if not bids_id:
+            continue
+        studies_per_cluster[bids_id].update(study_set)
+
     inferred_session: dict[str, dict[tuple[str, str, str], str]] = {}
-    for subj_key, study_set in subject_studies.items():
+    for bids_id, study_set in studies_per_cluster.items():
         if len(study_set) <= 1:
             continue
         ordered = sorted(study_set, key=lambda t: (t[1], t[2], t[0]))
-        inferred_session[subj_key] = {
+        inferred_session[bids_id] = {
             tup: f"ses-{idx + 1:d}" for idx, tup in enumerate(ordered)
         }
 
@@ -320,7 +344,8 @@ def scan_dicoms_long(
                 # otherwise fall back to inferred longitudinal label.
                 row_session = session
                 if not row_session:
-                    inferred = inferred_session.get(subj_key, {}).get(study_tuple)
+                    bids_id = bids_map[subj_key]
+                    inferred = inferred_session.get(bids_id, {}).get(study_tuple)
                     if inferred:
                         row_session = inferred
 
@@ -350,6 +375,7 @@ def scan_dicoms_long(
     # Collapse magnitude/phase rows for fieldmaps (v0.2.5 behaviour).
     if not df.empty:
         df = _collapse_fieldmap_rows(df)
+        df = _assign_chronological_rep(df)
 
     # Add proposed_* columns as empty (filled by CLI orchestrator after BidsGuess).
     for col in ("proposed_datatype", "proposed_basename", "Proposed BIDS name"):
@@ -367,6 +393,32 @@ def scan_dicoms_long(
         df.to_csv(output_tsv, sep="\t", index=False, columns=visible_columns)
         print(f"Inventory written to: {output_tsv}")
 
+    return df
+
+
+def _assign_chronological_rep(df: pd.DataFrame) -> pd.DataFrame:
+    """Populate ``rep`` with the chronological position within each
+    ``(BIDS_name, session, sequence, image_type)`` group.
+
+    Within a group (same subject, same session, same SeriesDescription,
+    same image_type), rows are ordered by ``acq_time`` (then ``series_uid``
+    as deterministic tiebreaker), and assigned ``1, 2, 3, …``. Singleton
+    groups receive an empty string so the column makes the repetition
+    visually obvious without polluting one-off acquisitions.
+    """
+
+    if df.empty:
+        return df
+
+    df = df.copy()
+    keys = ["BIDS_name", "session", "sequence", "image_type"]
+    sort_keys = keys + ["acq_time", "series_uid"]
+    # Stable sort by acquisition time inside each group.
+    df.sort_values(sort_keys, inplace=True, kind="stable")
+    counts = df.groupby(keys).cumcount() + 1
+    sizes = df.groupby(keys)["sequence"].transform("size")
+    rep_series = counts.where(sizes > 1, "")
+    df["rep"] = rep_series.astype(object)
     return df
 
 

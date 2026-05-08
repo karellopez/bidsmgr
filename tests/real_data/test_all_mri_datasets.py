@@ -139,6 +139,41 @@ def test_ppmi_longitudinal_sessions_split():
     )
 
 
+def test_rep_column_chronological_within_groups():
+    """Rep column must be the chronological position within each
+    ``(BIDS_name, session, sequence, image_type)`` group of size > 1.
+
+    PPMI ses-1 has 5 ``2D GRE-MT`` acquisitions of the same image_type
+    in time order — they must be numbered ``1, 2, 3, 4, 5``.
+    """
+    if not REAL_MRI_ROOT.exists():
+        pytest.skip("real MRI dataset root missing")
+    ppmi = REAL_MRI_ROOT / "PPMI"
+    if not ppmi.exists():
+        pytest.skip("PPMI dataset missing")
+    out = REAL_MRI_ROOT.parent / "_pytest_rep_chronological.tsv"
+    try:
+        run_scan(ppmi, out, n_jobs=4)
+        df = pd.read_csv(out, sep="\t", keep_default_na=False, dtype=str)
+    finally:
+        try:
+            out.unlink()
+        except FileNotFoundError:
+            pass
+
+    grp = df[
+        (df["BIDS_name"] == "sub-001")
+        & (df["session"] == "ses-1")
+        & (df["sequence"] == "2D GRE-MT")
+        & (df["image_type"] == "M")
+    ].sort_values(["acq_time", "series_uid"])
+    assert len(grp) >= 2, "expected the PPMI multi-acquisition GRE-MT cluster"
+    reps = list(grp["rep"])
+    assert reps == [str(i + 1) for i in range(len(grp))], (
+        f"rep column not chronological: {reps}"
+    )
+
+
 def test_repetition_type_column_present():
     """Every dataset's TSV must have the new ``repetition_type`` column."""
     if not REAL_MRI_ROOT.exists():
