@@ -94,6 +94,83 @@ _DESIGN_MARKER_RE = _re.compile(
 )
 
 
+def _reroute_b0_references_to_fmap_epi(
+    rows: list[InventoryRow],
+    chosen: dict[str, Classification],
+) -> dict[str, Classification]:
+    """Reroute likely B0-reference DWI rows to ``fmap/epi``.
+
+    Heuristic: a row currently classified as ``dwi/dwi`` whose
+    SeriesDescription contains a recognisable B0 marker (``b0``,
+    ``acq-Nb0``, ``b0map``, ``b0_ref``, ``b0rf``) AND whose ``n_files`` is
+    less than 50 % of the largest ``dwi/dwi`` peer in the same
+    ``(subject, session)`` group is treated as a PEpolar fmap reference
+    rather than a real DWI run. Single-volume reference scans for
+    distortion correction are exactly what BIDS ``fmap/_epi`` is for.
+
+    The user can re-route back to ``dwi/_dwi`` via the GUI if the b0
+    series is meant as a real b=0-only DWI acquisition. We surface the
+    decision in ``proposed_issues`` (added downstream by
+    ``_augment_dataframe``).
+    """
+
+    rows_by_id = {r.row_id.hex: r for r in rows}
+
+    # Per (subject, session), collect the n_files of every dwi/dwi row.
+    # Used to compare each candidate against its TRUE peers (excluding
+    # the candidate itself).
+    peers_files: dict[tuple[str, str], list[tuple[str, int]]] = defaultdict(list)
+    for k, c in chosen.items():
+        if c.datatype != "dwi" or c.suffix != "dwi":
+            continue
+        row = rows_by_id.get(k)
+        if row is None:
+            continue
+        gk = (row.subject_hint or "", row.session_hint or "")
+        peers_files[gk].append((k, row.n_files or 0))
+
+    for k, c in list(chosen.items()):
+        if c.datatype != "dwi" or c.suffix != "dwi":
+            continue
+        row = rows_by_id.get(k)
+        if row is None:
+            continue
+        if not sequence_dict.looks_like_b0_reference(row.series_description):
+            continue
+        gk = (row.subject_hint or "", row.session_hint or "")
+        # Largest n_files among OTHER dwi rows in the same session.
+        other_max = max(
+            (n for kk, n in peers_files.get(gk, ()) if kk != k),
+            default=0,
+        )
+        # No real peer → keep as ``dwi`` (could be a b=0-only DWI run; the
+        # user reviews). Reroute only when there's a substantially larger
+        # DWI peer that this row could be a reference for.
+        if other_max == 0:
+            continue
+        if (row.n_files or 0) >= other_max * 0.5:
+            continue
+        new_entities = dict(c.candidate_entities)
+        # ``epi`` allows direction / acquisition / run / part etc.; nothing
+        # to strip.
+        chosen[k] = Classification(
+            row_id=c.row_id,
+            classifier=c.classifier + "+b0_reroute",
+            datatype="fmap",
+            suffix="epi",
+            candidate_entities=new_entities,
+            confidence=c.confidence,
+            rationale=(
+                f"{c.rationale} | rerouted to fmap/epi: SeriesDescription "
+                f"{row.series_description!r} matches B0 marker and "
+                f"n_files={row.n_files} ≤ 50% of peer max ({other_max})"
+            ),
+            skip=False,
+        )
+
+    return chosen
+
+
 def _has_design_marker(seq_desc: Optional[str]) -> bool:
     """True when the SeriesDescription encodes a design-level repetition.
 
@@ -153,6 +230,12 @@ def _is_classification_schema_valid(c: Classification) -> bool:
     """Return ``True`` if (datatype, suffix, candidate_entities) round-trips through the schema."""
     if c.skip or c.datatype == "discard":
         return True  # treated as a "no-emit" decision; doesn't need to be valid
+    if c.datatype == "derivatives":
+        # Derivatives live outside the raw BIDS schema validation surface;
+        # the scan step just needs a non-empty suffix + subject. The actual
+        # path is built by ``_propose_basename`` against the derivatives
+        # convention, not via ``schema.build_basename``.
+        return bool(c.suffix)
     if c.datatype not in schema.list_datatypes():
         return False
     if c.suffix not in schema.list_suffixes(c.datatype):
@@ -178,17 +261,30 @@ def _run_classifier_chain(rows: list[InventoryRow]) -> dict[str, Classification]
         log.warning("BidsGuess skipped: %s", exc)
         bg_results = []
 
+    rows_by_id = {r.row_id.hex: r for r in rows}
+
     chosen: dict[str, Classification] = {}
     for c in bg_results:
         if not _is_classification_schema_valid(c):
             log.debug("BidsGuess result rejected by schema: %s", c)
             continue
+        # BidsGuess often emits a generic ``dwi`` suffix for series whose
+        # SeriesDescription clearly marks them as scanner-derivatives
+        # (``..._FA``, ``..._ADC``, ``..._TENSOR``). When that happens,
+        # let the sequence_dict layer override with the correct
+        # specialised suffix.
+        row = rows_by_id.get(c.row_id.hex)
+        if row and c.datatype == "dwi" and c.suffix == "dwi":
+            if sequence_dict.detect_dwi_derivative(row.series_description):
+                continue
         key = c.row_id.hex
         existing = chosen.get(key)
         if existing is None or c.confidence > existing.confidence:
             chosen[key] = c
 
-    # Layer 3 — legacy regex/sequence-dictionary classifier.
+    # Layer 3 — legacy regex/sequence-dictionary classifier (also runs the
+    # DWI scanner-derivative detector for the rows we just bounced from
+    # BidsGuess).
     needs_fallback = [r for r in rows if r.row_id.hex not in chosen]
     fb_results = sequence_dict.classify(needs_fallback)
     for c in fb_results:
@@ -473,12 +569,24 @@ def _normalize_runs(
 # ---------------------------------------------------------------------------
 
 
+_DERIVATIVES_PIPELINE = "dcm2niix"
+
+
 def _propose_basename(
     bids_name: str,
     session: str,
     classification: Classification,
 ) -> tuple[str, str, list[str]]:
-    """Return ``(datatype, basename, issues)`` for a classification.
+    """Return ``(datatype_or_path, basename, issues)`` for a classification.
+
+    For raw BIDS classifications, the first tuple element is the datatype
+    name (``anat`` / ``func`` / ``dwi`` / ``fmap`` / ``perf`` / …).
+
+    For ``classification.datatype == "derivatives"``, the first element is
+    the *full* relative directory path (``derivatives/<pipeline>/sub-XXX``
+    or ``derivatives/<pipeline>/sub-XXX/ses-Y/dwi``) — the converter
+    backend writes the file there. The basename uses ``_desc-<SUFFIX>_dwi``
+    so the actual filename remains valid BIDS-derivatives.
 
     ``issues`` is a list of human-readable validation messages; an empty
     list means the proposal is schema-valid and ready to commit.
@@ -499,6 +607,9 @@ def _propose_basename(
 
     datatype = classification.datatype
     suffix = classification.suffix
+
+    if datatype == "derivatives":
+        return _propose_derivatives_basename(entities, suffix)
 
     # Strip entities the schema doesn't allow for this (datatype, suffix).
     allowed = set(schema.allowed_entities(datatype, suffix))
@@ -525,6 +636,57 @@ def _propose_basename(
         return (datatype, "", issues + [f"build_basename: {exc}"])
 
     return datatype, basename, issues
+
+
+def _propose_derivatives_basename(
+    entities: dict[str, str],
+    suffix: str,
+) -> tuple[str, str, list[str]]:
+    """Build a ``derivatives/<pipeline>/sub-XXX/[ses-Y/]dwi`` path with a
+    ``_desc-<SUFFIX>_dwi`` basename.
+
+    Used for scanner-derivatives that have no canonical raw BIDS suffix
+    (the most common one is ``TENSOR``). Raw BIDS suffixes for DWI
+    derivatives — ``ADC``, ``FA``, ``S0map``, ``colFA``, ``expADC``,
+    ``trace`` — are handled by the regular path above.
+    """
+
+    bids_name = entities.get("subject", "")
+    session = entities.get("session", "")
+    if not bids_name:
+        return ("", "", ["BIDS_name missing"])
+
+    parts = [f"derivatives/{_DERIVATIVES_PIPELINE}", f"sub-{bids_name}"]
+    if session:
+        parts.append(f"ses-{session}")
+    parts.append("dwi")
+    target_dir = "/".join(parts)
+
+    # Build a canonical basename. Reuse ``schema.build_basename`` against
+    # ``dwi`` + ``_dwi`` so entity ordering matches the rest of the BIDS
+    # tree, then append ``_desc-<SUFFIX>``.
+    dwi_entities = dict(entities)
+    allowed = set(schema.allowed_entities("dwi", "dwi"))
+    for ent in list(dwi_entities.keys()):
+        if ent != "subject" and ent not in allowed:
+            dwi_entities.pop(ent, None)
+    try:
+        dwi_base = schema.build_basename(dwi_entities, "dwi", "dwi")
+    except (ValueError, KeyError) as exc:
+        return (target_dir, "", [f"build_basename: {exc}"])
+
+    # ``sub-001_acq-X_run-1_dwi`` → ``sub-001_acq-X_run-1_desc-TENSOR_dwi``.
+    if dwi_base.endswith("_dwi"):
+        stem = dwi_base[: -len("_dwi")]
+        basename = f"{stem}_desc-{suffix}_dwi"
+    else:
+        basename = f"{dwi_base}_desc-{suffix}"
+
+    issues = [
+        f"derivatives: scanner-computed map ({suffix!r}) — no canonical "
+        f"raw BIDS suffix; routed under {target_dir}"
+    ]
+    return target_dir, basename, issues
 
 
 def _placeholder_for_entity(entity: str) -> str:
@@ -617,6 +779,35 @@ def _augment_dataframe(
             )
             df.at[df_idx, "include"] = 0
 
+        # B0 reference reroute: surfaced via the classifier name suffix.
+        if "+b0_reroute" in best.classifier:
+            annotated_issues.append(
+                "rerouted to fmap/epi: SeriesDescription contains a B0 marker "
+                "and file count is much smaller than the longest DWI peer in "
+                "this session (likely a PEpolar reference for distortion "
+                "correction; user may re-route to dwi/_dwi if it is a real "
+                "b=0 DWI run)"
+            )
+
+        # fmap multi-output annotation: a single ``gre_field_mapping`` (and
+        # similar) DICOM series produces several NIfTI files after dcm2niix
+        # conversion (magnitude1, magnitude2, phasediff). The TSV row only
+        # shows one representative basename — flag it so the user knows.
+        if best.datatype == "fmap" and best.suffix in {
+            "phasediff", "magnitude1", "magnitude2", "magnitude", "fieldmap",
+        }:
+            # Only annotate when image_type marks both magnitude+phase
+            # outputs (collapsed fmap row carries combined image_type "MP"
+            # or contains "P").
+            img_type = str(df.at[df_idx, "image_type"] or "")
+            if "P" in img_type and "M" in img_type:
+                annotated_issues.append(
+                    "fmap multi-output: this single DICOM series produces "
+                    "magnitude1 + magnitude2 + phasediff after dcm2niix "
+                    "conversion; the proposed basename above is one of three "
+                    "files that will be written into fmap/"
+                )
+
         df.at[df_idx, "proposed_issues"] = " | ".join(annotated_issues)
 
         if best.skip:
@@ -664,6 +855,7 @@ def run_scan(
     else:
         chosen = _run_classifier_chain(rows)
 
+    chosen = _reroute_b0_references_to_fmap_epi(rows, chosen)
     abort_verdicts = _detect_aborts(rows, chosen)
     chosen = _normalize_runs(rows, chosen, abort_verdicts)
     df = _augment_dataframe(df, rows, chosen, abort_verdicts)

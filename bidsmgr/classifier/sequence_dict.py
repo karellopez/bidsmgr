@@ -281,6 +281,65 @@ _MODALITY_TO_SUFFIX: dict[str, str] = {
 }
 
 
+# DWI scanner-derivative detection (architecture.md §4.2; BIDS 1.11+ rule
+# group ``dwi.ScannerDerivatives``). When ``SeriesDescription`` ends in one
+# of these tokens, the DICOM series is a scanner-computed derivative of a
+# DWI acquisition and should be emitted with its own BIDS suffix in
+# ``dwi/``, not as a raw ``_dwi`` file. ``TENSOR`` has no canonical raw
+# suffix; we route it to ``derivatives/`` per the v0.2.5 convention.
+_DWI_DERIVATIVE_PATTERNS: tuple[tuple[str, str, str], ...] = (
+    # (regex, BIDS suffix, target datatype)
+    (r"(?:^|[_-])(?:colfa|col[_-]?fa)(?=$|[_-])", "colFA", "dwi"),
+    (r"(?:^|[_-])(?:expadc|exp[_-]?adc)(?=$|[_-])", "expADC", "dwi"),
+    (r"(?:^|[_-])tracew?(?=$|[_-])", "trace", "dwi"),
+    (r"(?:^|[_-])tensor(?=$|[_-])", "TENSOR", "derivatives"),
+    (r"(?:^|[_-])fa(?=$|[_-])", "FA", "dwi"),
+    (r"(?:^|[_-])adc(?=$|[_-])", "ADC", "dwi"),
+    (r"(?:^|[_-])s0[_-]?map(?=$|[_-])", "S0map", "dwi"),
+)
+
+
+def detect_dwi_derivative(sequence: Optional[str]) -> Optional[tuple[str, str]]:
+    """Return ``(bids_suffix, target_datatype)`` if ``sequence`` is a known
+    scanner-computed DWI derivative, else ``None``.
+
+    Only fires when the marker token is at a word boundary so generic
+    sequences like ``MPRAGE_FATsat`` are not mis-detected as ``FA``.
+    """
+
+    if not sequence:
+        return None
+    low = sequence.lower()
+    for pattern, suffix, datatype in _DWI_DERIVATIVE_PATTERNS:
+        if re.search(pattern, low):
+            return suffix, datatype
+    return None
+
+
+# B0-reference detection. Matches sequences whose name contains a clear
+# ``b0`` marker indicating a single-volume (or short) phase-encoding
+# reference scan acquired alongside DWI/func runs for distortion
+# correction. BIDS treats these as PEpolar fmaps (``fmap/_epi``); the
+# user can re-route to ``dwi/_dwi`` via the GUI if it's a real b=0 DWI
+# acquisition rather than a fmap reference.
+_B0_REFERENCE_RE = re.compile(
+    r"(?:^|[_-])(?:"
+    r"b0[_-]?map|"          # b0_map / b0map
+    r"\d*b0(?=$|[_-])|"     # 1b0 / 15b0 / b0 (boundary)
+    r"b0[_-]?ref|"          # b0_ref
+    r"b0rf"                 # Siemens specific
+    r")",
+    re.IGNORECASE,
+)
+
+
+def looks_like_b0_reference(sequence: Optional[str]) -> bool:
+    """True when ``sequence`` contains a recognisable B0 / PEpolar marker."""
+    if not sequence:
+        return False
+    return bool(_B0_REFERENCE_RE.search(sequence))
+
+
 def classify(rows: Iterable[InventoryRow]) -> list[Classification]:
     """Legacy regex/sequence-dictionary classifier — architecture.md §4.2 layer 3.
 
@@ -299,9 +358,43 @@ def classify(rows: Iterable[InventoryRow]) -> list[Classification]:
 
     out: list[Classification] = []
     for row in rows:
+        sequence = row.series_description or ""
+
+        # 1. DWI scanner-derivative detection (FA / ADC / trace / colFA /
+        #    expADC / S0map / TENSOR). Runs *before* the legacy modality
+        #    map so a sequence like ``..._dwi_FA`` is correctly emitted as
+        #    suffix ``FA`` rather than ``dwi``.
+        dwi_deriv = detect_dwi_derivative(sequence)
+        if dwi_deriv:
+            suffix, datatype = dwi_deriv
+            entities: dict[str, str] = {}
+            direction = extract_direction_token(sequence)
+            if direction:
+                entities["direction"] = direction.upper()
+            acq = extract_acq_token(sequence)
+            if acq:
+                entities["acquisition"] = acq
+            rationale = (
+                f"sequence_dict: DWI scanner-derivative "
+                f"(suffix={suffix!r}, datatype={datatype!r})"
+            )
+            out.append(
+                Classification(
+                    row_id=row.row_id,
+                    classifier="sequence_dict",
+                    datatype=datatype,
+                    suffix=suffix,
+                    candidate_entities=entities,
+                    confidence=0.45,  # higher than generic fallback
+                    rationale=rationale,
+                    skip=False,
+                )
+            )
+            continue
+
         modality = row.fine_modality
         if not modality:
-            modality = guess_modality(row.series_description or "")
+            modality = guess_modality(sequence)
         suffix = _MODALITY_TO_SUFFIX.get(modality)
         if not suffix:
             continue
@@ -311,8 +404,7 @@ def classify(rows: Iterable[InventoryRow]) -> list[Classification]:
         if not datatype:
             continue
 
-        entities: dict[str, str] = {}
-        sequence = row.series_description or ""
+        entities = {}
 
         # Direction is helpful for fmap epi / dwi / func.
         direction = extract_direction_token(sequence)
@@ -358,5 +450,7 @@ __all__ = [
     "guess_task_from_text",
     "extract_acq_token",
     "extract_direction_token",
+    "detect_dwi_derivative",
+    "looks_like_b0_reference",
     "classify",
 ]

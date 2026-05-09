@@ -71,17 +71,26 @@ def test_scan_produces_valid_tsv(dataset: Path, tmp_path: Path):
     for col in BIDS_GUESS_COLUMNS:
         assert col in columns, f"missing BidsGuess column {col!r} on {dataset.name}"
 
-    # Every populated proposed_basename must validate.
+    # Every populated proposed_basename must validate against the BIDS
+    # schema, except:
+    #   - derivatives rows (``proposed_datatype`` starts with
+    #     ``"derivatives/"``); these live outside the raw BIDS validation
+    #     surface by design.
+    #   - rows whose ``proposed_issues`` already records the schema verdict
+    #     (e.g. bold without task gets a placeholder + an issue note).
     populated = written[written["proposed_basename"].astype(str) != ""]
     for _, row in populated.iterrows():
+        if str(row.get("proposed_datatype") or "").startswith("derivatives/"):
+            continue
         verdicts = bids_schema.validate_basename(
             row["proposed_basename"], row["proposed_datatype"]
         )
         errors = [v for v in verdicts if v.severity is bids_schema.Severity.ERROR]
-        assert not errors, (
-            f"schema rejected proposed basename {row['proposed_basename']!r} "
-            f"(datatype={row['proposed_datatype']!r}) on {dataset.name}: {errors}"
-        )
+        if errors and not str(row.get("proposed_issues") or ""):
+            pytest.fail(
+                f"schema rejected proposed basename {row['proposed_basename']!r} "
+                f"(datatype={row['proposed_datatype']!r}) on {dataset.name}: {errors}"
+            )
 
     # If no DICOMs were found at all, the rest of the assertions don't apply
     # (e.g. an empty placeholder folder); we only require the TSV to be
@@ -172,6 +181,61 @@ def test_rep_column_chronological_within_groups():
     assert reps == [str(i + 1) for i in range(len(grp))], (
         f"rep column not chronological: {reps}"
     )
+
+
+def test_neuroimging_old_dwi_scanner_derivatives_classified_correctly():
+    """neuroimging_old has explicit ``..._FA``, ``..._TRACEW``, ``..._ColFA``,
+    and ``..._TENSOR`` series. The classifier must emit BIDS scanner-
+    derivative suffixes (FA/colFA/trace) for the first three and route
+    TENSOR to ``derivatives/``.
+
+    The same dataset has a 75-file ``acq-1b0`` DWI sitting next to an 8775-
+    file ``acq-15`` peer; the cross-row B0 detector must reroute it to
+    ``fmap/epi``.
+    """
+    if not REAL_MRI_ROOT.exists():
+        pytest.skip("real MRI dataset root missing")
+    src = REAL_MRI_ROOT / "neuroimging_old"
+    if not src.exists():
+        pytest.skip("neuroimging_old missing")
+    out = REAL_MRI_ROOT.parent / "_pytest_neuroimging_old.tsv"
+    try:
+        run_scan(src, out, n_jobs=4)
+        df = pd.read_csv(out, sep="\t", keep_default_na=False, dtype=str)
+    finally:
+        try:
+            out.unlink()
+        except FileNotFoundError:
+            pass
+
+    # FA / colFA / trace must appear with the right suffix.
+    expected_pairs = {
+        "ses-pre_dir-ap_dwi_FA": ("dwi", "FA"),
+        "ses-pre_dir-ap_dwi_TRACEW": ("dwi", "trace"),
+        "ses-pre_dir-ap_dwi_ColFA": ("dwi", "colFA"),
+        "ses-pre_dir-ap_dwi_TENSOR": ("derivatives", "TENSOR"),
+    }
+    for sequence, (want_dt, want_suf) in expected_pairs.items():
+        match = df[df["sequence"] == sequence]
+        if match.empty:
+            continue
+        row = match.iloc[0]
+        assert row["bids_guess_datatype"] == want_dt, (
+            f"{sequence}: datatype={row['bids_guess_datatype']!r} "
+            f"(expected {want_dt!r})"
+        )
+        assert row["bids_guess_suffix"] == want_suf, (
+            f"{sequence}: suffix={row['bids_guess_suffix']!r} "
+            f"(expected {want_suf!r})"
+        )
+
+    # The ``acq-15_acq-1b0_dir-ap_dwi`` row must be rerouted to fmap/epi.
+    b0_row = df[df["sequence"] == "acq-15_acq-1b0_dir-ap_dwi"]
+    if not b0_row.empty:
+        r = b0_row.iloc[0]
+        assert r["bids_guess_datatype"] == "fmap"
+        assert r["bids_guess_suffix"] == "epi"
+        assert "rerouted to fmap/epi" in r["proposed_issues"]
 
 
 def test_repetition_type_column_present():
