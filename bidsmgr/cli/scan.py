@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import re as _re
+import shutil
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -44,7 +45,9 @@ import pandas as pd
 from .. import schema
 from ..classifier import dcm2niix_bidsguess, sequence_dict
 from ..classifier.types import Classification
+from ..inventory import probe_convert as probe_convert_module
 from ..inventory.mri_dicom import EXTENDED_COLUMNS, TSV_COLUMNS, scan_dicoms_long
+from ..inventory.probe_convert import ProbeFileStats
 from ..inventory.types import InventoryRow
 
 log = logging.getLogger(__name__)
@@ -61,6 +64,51 @@ BIDS_GUESS_COLUMNS: tuple[str, ...] = (
     "proposed_issues",
     "repetition_type",
 )
+
+# Columns added when ``--probe-convert`` is enabled. dcm2niix actually
+# converts each DICOM series and we record what it produced.
+PROBE_COLUMNS: tuple[str, ...] = (
+    "probe_n_files",
+    "probe_n_nifti",
+    "probe_n_volumes",
+    "probe_extensions",
+)
+
+
+# Per (datatype, suffix) — how many NIfTI files dcm2niix should produce
+# from one input DICOM series. ``None`` means "don't flag, expectations
+# vary widely". Anything not listed defaults to 1. Used by the anomaly
+# detector to flag e.g. a bold series that produced 2 NIfTIs (the
+# operator-cancellation case the user asked about).
+EXPECTED_NIFTI_PER_UID: dict[tuple[str, Optional[str]], Optional[int]] = {
+    ("anat", "T1w"): 1,
+    ("anat", "T2w"): 1,
+    ("anat", "FLAIR"): 1,
+    ("anat", "T2starw"): 1,
+    ("anat", "PDw"): 1,
+    ("anat", "MP2RAGE"): None,  # multi-inversion → multiple NIfTIs expected
+    ("anat", "T1map"): 1,
+    ("anat", "UNIT1"): 1,
+    ("anat", "MEGRE"): None,    # multi-echo
+    ("func", "bold"): 1,
+    ("func", "sbref"): 1,
+    ("func", "phase"): 1,
+    ("dwi", "dwi"): 1,
+    ("dwi", "FA"): 1,
+    ("dwi", "ADC"): 1,
+    ("dwi", "trace"): 1,
+    ("dwi", "colFA"): 1,
+    ("dwi", "expADC"): 1,
+    ("dwi", "S0map"): 1,
+    ("dwi", "sbref"): 1,
+    ("fmap", "phasediff"): None,  # 1 DICOM series → mag1+mag2+phasediff (typically 3)
+    ("fmap", "magnitude1"): None,
+    ("fmap", "magnitude2"): None,
+    ("fmap", "fieldmap"): None,
+    ("fmap", "epi"): 1,
+    ("perf", "asl"): 1,
+    ("perf", "m0scan"): 1,
+}
 
 
 # Heuristic thresholds for distinguishing planned repeats from operator
@@ -705,6 +753,7 @@ def _augment_dataframe(
     rows: list[InventoryRow],
     chosen: dict[str, Classification],
     abort_verdicts: Optional[dict[str, str]] = None,
+    probe_stats: Optional[dict[str, ProbeFileStats]] = None,
 ) -> pd.DataFrame:
     """Merge classifier output back into the inventory DataFrame.
 
@@ -714,6 +763,7 @@ def _augment_dataframe(
     """
 
     abort_verdicts = abort_verdicts or {}
+    probe_stats = probe_stats or {}
 
     # Index rows by DataFrame index.
     rows_by_df_idx: dict[int, list[InventoryRow]] = defaultdict(list)
@@ -725,6 +775,11 @@ def _augment_dataframe(
     for col in BIDS_GUESS_COLUMNS:
         if col not in df.columns:
             df[col] = ""
+
+    if probe_stats:
+        for col in PROBE_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
 
     for df_idx, group_rows in rows_by_df_idx.items():
         # Pick best classification for this DataFrame row.
@@ -819,7 +874,80 @@ def _augment_dataframe(
             df.at[df_idx, "proposed_basename"] = basename
             df.at[df_idx, "Proposed BIDS name"] = f"{datatype}/{basename}{ext}"
 
+        # Probe-convert columns + anomaly detection. Aggregate every
+        # probe stat across the underlying UIDs of this DataFrame row
+        # (fmap collapse joins multiple UIDs into one row).
+        if probe_stats:
+            uids = []
+            uids_field = str(df.at[df_idx, "series_uid"] or "")
+            for u in uids_field.split("|"):
+                u = u.strip()
+                if u:
+                    uids.append(u)
+            n_files_total = 0
+            n_nifti_total = 0
+            n_volumes_max = 0
+            ext_set: set[str] = set()
+            seen = False
+            for u in uids:
+                ps = probe_stats.get(u)
+                if ps is None:
+                    continue
+                seen = True
+                n_files_total += ps.n_files
+                n_nifti_total += ps.n_nifti
+                if ps.n_volumes_max > n_volumes_max:
+                    n_volumes_max = ps.n_volumes_max
+                ext_set.update(ps.extensions)
+            if seen:
+                df.at[df_idx, "probe_n_files"] = n_files_total
+                df.at[df_idx, "probe_n_nifti"] = n_nifti_total
+                df.at[df_idx, "probe_n_volumes"] = n_volumes_max
+                df.at[df_idx, "probe_extensions"] = ",".join(sorted(ext_set))
+
+                anomaly = _probe_anomaly(
+                    best.datatype, best.suffix,
+                    n_nifti=n_nifti_total,
+                    n_uids=len(uids),
+                )
+                if anomaly:
+                    annotated_issues.append(anomaly)
+                    df.at[df_idx, "proposed_issues"] = " | ".join(annotated_issues)
+
     return df
+
+
+def _probe_anomaly(
+    datatype: str, suffix: str, *, n_nifti: int, n_uids: int,
+) -> Optional[str]:
+    """Return a human-readable anomaly note when the converted output
+    doesn't match what's expected for this (datatype, suffix), or
+    ``None`` if everything looks normal.
+
+    The user's headline case: a bold task that the technician manually
+    aborted produces an extra volume that dcm2niix splits into a
+    separate NIfTI. Detection: ``func/bold`` should produce 1 NIfTI per
+    input UID; getting 2+ flags the row.
+    """
+
+    expected = EXPECTED_NIFTI_PER_UID.get((datatype, suffix))
+    if expected is None:
+        return None
+    expected_total = expected * n_uids
+    if n_nifti == expected_total:
+        return None
+    if n_nifti > expected_total:
+        return (
+            f"probe: dcm2niix produced {n_nifti} NIfTI(s) from {n_uids} input "
+            f"DICOM series — expected {expected_total} for {datatype}/{suffix} "
+            f"(possible split conversion: extra volume from a manually-cancelled "
+            f"acquisition or unexpected multi-echo / multi-part output)"
+        )
+    return (
+        f"probe: dcm2niix produced {n_nifti} NIfTI(s) from {n_uids} input "
+        f"DICOM series — expected {expected_total} for {datatype}/{suffix} "
+        f"(missing output? check dcm2niix stderr / DICOM integrity)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -833,8 +961,28 @@ def run_scan(
     *,
     n_jobs: int = 1,
     skip_bids_guess: bool = False,
+    probe_convert: bool = False,
 ) -> pd.DataFrame:
-    """Run the full scan pipeline and return the DataFrame written to TSV."""
+    """Run the full scan pipeline and return the DataFrame written to TSV.
+
+    Parameters
+    ----------
+    n_jobs
+        Number of parallel workers. Drives both DICOM-header reading
+        during the scan AND the per-series dcm2niix invocations during
+        the probe pass.
+    probe_convert
+        When ``True``, run dcm2niix on each *detected sequence* (one
+        invocation per ``SeriesInstanceUID``) by symlinking just that
+        series's source DICOMs into a staging folder under
+        ``<output_tsv_parent>/.tmp/``. The probe pass produces
+        per-series NIfTI / sidecar / bvec / bval; anomalies (e.g. a
+        bold series that produced 2 NIfTI files because of an
+        operator-aborted volume) surface in ``proposed_issues``. The
+        ``.tmp/`` scratch tree is **always wiped** when ``run_scan``
+        returns — including on error — so the user is left with the
+        inventory TSV and nothing else.
+    """
 
     df = scan_dicoms_long(dicom_root, output_tsv=None, n_jobs=n_jobs)
 
@@ -858,12 +1006,51 @@ def run_scan(
     chosen = _reroute_b0_references_to_fmap_epi(rows, chosen)
     abort_verdicts = _detect_aborts(rows, chosen)
     chosen = _normalize_runs(rows, chosen, abort_verdicts)
-    df = _augment_dataframe(df, rows, chosen, abort_verdicts)
+
+    probe_stats: dict[str, ProbeFileStats] = {}
+    if probe_convert:
+        probe_dir = Path(output_tsv).parent / ".tmp"
+        files_by_uid = df.attrs.get("files_by_uid", {})
+        if not files_by_uid:
+            log.warning(
+                "probe-convert requested but the inventory is missing "
+                "df.attrs['files_by_uid']; skipping."
+            )
+        else:
+            try:
+                print(
+                    f"probe-convert: per-series dcm2niix into {probe_dir} "
+                    f"(n_jobs={n_jobs})"
+                )
+                probe_stats = probe_convert_module.probe_rows(
+                    rows, probe_dir, files_by_uid, n_jobs=n_jobs,
+                )
+            except FileNotFoundError as exc:
+                log.warning("probe-convert skipped: %s", exc)
+                probe_stats = {}
+            finally:
+                # The probe ``.tmp/`` directory is *always* removed once
+                # we've harvested the stats — including when the probe
+                # itself failed. The user is left with the inventory TSV
+                # and no scratch tree. The probe is non-load-bearing for
+                # the inventory so cleanup must not raise.
+                if probe_dir.exists():
+                    try:
+                        shutil.rmtree(probe_dir)
+                        log.info("probe-convert: removed scratch %s", probe_dir)
+                    except OSError as exc:
+                        log.warning(
+                            "probe-convert: could not remove %s: %s",
+                            probe_dir, exc,
+                        )
+
+    df = _augment_dataframe(df, rows, chosen, abort_verdicts, probe_stats)
 
     df.drop(columns=["_source_dir"], errors="ignore", inplace=True)
     columns = (
         [c for c in TSV_COLUMNS if c in df.columns]
         + [c for c in BIDS_GUESS_COLUMNS if c in df.columns]
+        + [c for c in PROBE_COLUMNS if c in df.columns]
         + [c for c in EXTENDED_COLUMNS if c in df.columns]
     )
     df.to_csv(output_tsv, sep="\t", index=False, columns=columns)
@@ -887,6 +1074,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Skip the dcm2niix BidsGuess classifier and use only the legacy regex layer",
     )
     parser.add_argument(
+        "--probe-convert",
+        action="store_true",
+        help=(
+            "After scanning, run dcm2niix on each detected sequence (one "
+            "invocation per SeriesInstanceUID) into a hidden "
+            "<output_tsv_parent>/.tmp/ staging tree, harvest the actual "
+            "files produced, and remove the staging tree. Adds "
+            "probe_n_files / probe_n_nifti / probe_n_volumes / "
+            "probe_extensions columns to the TSV and surfaces conversion "
+            "anomalies (e.g. a bold series that split into two NIfTIs "
+            "because of an operator-aborted volume) in proposed_issues. "
+            "The .tmp/ directory is always removed when this command "
+            "returns — including on error."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase log verbosity (-v INFO, -vv DEBUG)",
     )
@@ -900,6 +1103,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         Path(args.output_tsv),
         n_jobs=args.jobs,
         skip_bids_guess=args.no_bids_guess,
+        probe_convert=args.probe_convert,
     )
     return 0
 

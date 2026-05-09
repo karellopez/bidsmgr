@@ -181,6 +181,7 @@ def _read_one(fpath: str, root_dir: Path) -> Optional[dict]:
         "study_key": study,
         "folder": folder,
         "file_dir": file_root,
+        "file_path": fpath,
         "series": series,
         "uid": uid,
         "modality": guess_modality(series),
@@ -231,6 +232,10 @@ def scan_dicoms_long(
     study_uids: dict = defaultdict(lambda: defaultdict(dict))
     # all distinct study tuples seen for each subject (for session inference).
     subject_studies: dict = defaultdict(set)
+    # Per-SeriesInstanceUID list of source DICOM file paths. Used by
+    # ``probe_convert`` to symlink just one series's files into a per-row
+    # work directory before invoking dcm2niix.
+    files_by_uid: dict[str, list[str]] = defaultdict(list)
     demo: dict = {}
 
     file_list: list[str] = []
@@ -255,6 +260,10 @@ def scan_dicoms_long(
             acq_times[subj_key][folder][key] = res["acq_time"]
         if key not in file_dirs[subj_key][folder]:
             file_dirs[subj_key][folder][key] = res["file_dir"]
+        # Track every DICOM file path per UID for later per-series probe.
+        uid_str = res["uid"]
+        if uid_str:
+            files_by_uid[uid_str].append(res["file_path"])
         if res["sess_tag"]:
             sessset[subj_key][folder].add(res["sess_tag"])
         study_tuple = (
@@ -384,6 +393,12 @@ def scan_dicoms_long(
 
     if not df.empty:
         df.sort_values(["BIDS_name", "subject", "session", "acq_time"], inplace=True)
+
+    # Stash the per-UID file map on the DataFrame so callers (the CLI's
+    # probe_convert pass) can find the source DICOMs of each detected
+    # sequence without re-walking the disk. ``DataFrame.attrs`` survives
+    # standard pandas ops (slicing, copy, to_csv).
+    df.attrs["files_by_uid"] = {k: list(v) for k, v in files_by_uid.items()}
 
     visible_columns = [c for c in TSV_COLUMNS if c in df.columns] + [
         c for c in EXTENDED_COLUMNS if c in df.columns
