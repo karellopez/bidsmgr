@@ -30,6 +30,7 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import logging
 import os
@@ -46,7 +47,13 @@ from .. import schema
 from ..classifier import dcm2niix_bidsguess, sequence_dict
 from ..classifier.types import Classification
 from ..inventory import probe_convert as probe_convert_module
-from ..inventory.mri_dicom import EXTENDED_COLUMNS, TSV_COLUMNS, scan_dicoms_long
+from ..inventory._time import parse_dicom_time_seconds as _parse_dicom_time_seconds
+from ..inventory.mri_dicom import (
+    DATASET_COLUMNS,
+    EXTENDED_COLUMNS,
+    TSV_COLUMNS,
+    scan_dicoms_long,
+)
 from ..inventory.probe_convert import ProbeFileStats
 from ..inventory.types import InventoryRow
 
@@ -364,28 +371,6 @@ def _run_hint_from_sequence(text: Optional[str]) -> Optional[int]:
     try:
         return int(m.group(1))
     except ValueError:
-        return None
-
-
-def _parse_dicom_time_seconds(text: Optional[str]) -> Optional[float]:
-    """Convert DICOM TM (``HHMMSS.FFFFFF``) to seconds-since-midnight."""
-    if not text:
-        return None
-    s = text.strip()
-    if not s:
-        return None
-    try:
-        if "." in s:
-            base, frac = s.split(".", 1)
-        else:
-            base, frac = s, "0"
-        if len(base) < 6:
-            base = base.ljust(6, "0")
-        h = int(base[0:2])
-        m = int(base[2:4])
-        sec = int(base[4:6])
-        return h * 3600 + m * 60 + sec + float("0." + frac)
-    except (ValueError, IndexError):
         return None
 
 
@@ -955,6 +940,35 @@ def _probe_anomaly(
 # ---------------------------------------------------------------------------
 
 
+_SLUG_BAD_RE = _re.compile(r"[^a-z0-9_-]+")
+_SLUG_DASH_RE = _re.compile(r"-{2,}")
+
+
+def _default_dataset_slug(dicom_root: Path) -> str:
+    """Derive a safe default dataset slug from the input directory name.
+
+    Lowercases, replaces non-``[a-z0-9_-]`` runs with a single ``-``, and
+    collapses repeated dashes. Falls back to ``"dataset"`` for empty input.
+    """
+    raw = Path(dicom_root).name.lower()
+    slug = _SLUG_BAD_RE.sub("-", raw)
+    slug = _SLUG_DASH_RE.sub("-", slug).strip("-_")
+    return slug or "dataset"
+
+
+def _write_files_by_uid_sidecar(output_tsv: Path, files_by_uid: dict[str, list[str]]) -> Path:
+    """Write ``<output_tsv>.files_by_uid.json.gz`` next to the inventory.
+
+    The converter reads this sidecar to map each ``series_uid`` back to
+    its source DICOM file paths without re-walking the tree.
+    """
+    sidecar = output_tsv.with_suffix(output_tsv.suffix + ".files_by_uid.json.gz")
+    payload = json.dumps({k: list(v) for k, v in files_by_uid.items()}).encode("utf-8")
+    with gzip.open(sidecar, "wb") as fh:
+        fh.write(payload)
+    return sidecar
+
+
 def run_scan(
     dicom_root: Path,
     output_tsv: Path,
@@ -962,6 +976,7 @@ def run_scan(
     n_jobs: int = 1,
     skip_bids_guess: bool = False,
     probe_convert: bool = False,
+    dataset: Optional[str] = None,
 ) -> pd.DataFrame:
     """Run the full scan pipeline and return the DataFrame written to TSV.
 
@@ -984,7 +999,11 @@ def run_scan(
         inventory TSV and nothing else.
     """
 
-    df = scan_dicoms_long(dicom_root, output_tsv=None, n_jobs=n_jobs)
+    dataset_slug = dataset if dataset else _default_dataset_slug(dicom_root)
+
+    df = scan_dicoms_long(
+        dicom_root, output_tsv=None, n_jobs=n_jobs, dataset=dataset_slug,
+    )
 
     if df.empty:
         log.warning("no DICOMs found under %s", dicom_root)
@@ -1050,11 +1069,26 @@ def run_scan(
     columns = (
         [c for c in TSV_COLUMNS if c in df.columns]
         + [c for c in BIDS_GUESS_COLUMNS if c in df.columns]
+        + [c for c in DATASET_COLUMNS if c in df.columns]
         + [c for c in PROBE_COLUMNS if c in df.columns]
         + [c for c in EXTENDED_COLUMNS if c in df.columns]
     )
     df.to_csv(output_tsv, sep="\t", index=False, columns=columns)
     print(f"Inventory written to: {output_tsv}")
+
+    # Always write the per-UID DICOM file map next to the TSV. ``bidsmgr-convert``
+    # reads this sidecar to find the source files for each row's dcm2niix call.
+    files_by_uid = df.attrs.get("files_by_uid", {})
+    if files_by_uid:
+        sidecar_path = _write_files_by_uid_sidecar(output_tsv, files_by_uid)
+        print(f"files_by_uid sidecar written to: {sidecar_path}")
+    else:
+        log.warning(
+            "df.attrs['files_by_uid'] is empty; the files_by_uid sidecar "
+            "was not written, and bidsmgr-convert will not be able to "
+            "convert this inventory."
+        )
+
     return df
 
 
@@ -1090,6 +1124,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--dataset",
+        default=None,
+        help=(
+            "BIDS dataset slug stamped into every row's `dataset` column. "
+            "The converter writes each distinct value to "
+            "<bids_parent>/<dataset>/. Defaults to a slugified form of the "
+            "DICOM root directory name."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase log verbosity (-v INFO, -vv DEBUG)",
     )
@@ -1104,6 +1148,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         n_jobs=args.jobs,
         skip_bids_guess=args.no_bids_guess,
         probe_convert=args.probe_convert,
+        dataset=args.dataset,
     )
     return 0
 

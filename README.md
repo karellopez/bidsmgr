@@ -100,38 +100,184 @@ documented in `../improvement_plan.md` §12. Treat them as load-bearing:
 
 ---
 
-## Where to start (first feature)
+## Current state
 
-Per `../improvement_plan.md` M1 — **the dcm2niix `BidsGuess` classifier
-layer**. It's:
+The CLI loop **scan → convert** is implemented and validated end-to-end
+across all 10 reference MRI datasets (159 unit tests + 35 real-data
+tests, gated on `BIDS_MANAGER_REAL_MRI_DATA=1`).
 
-1. Self-contained (one module: `bidsmgr/classifier/dcm2niix_bidsguess.py`).
-2. High-leverage (improves classification accuracy on real Siemens
-   Prisma data immediately).
-3. The natural seed for the keystone (`bidsmgr.schema`) because it
-   produces `(datatype, suffix)` tuples that the schema engine has to
-   validate.
+| Stage | Module(s) | Status |
+|---|---|---|
+| Scan | `inventory/`, `classifier/`, `cli/scan.py` | done — produces inventory TSV + `files_by_uid` sidecar |
+| Convert | `converter/`, `fixups/`, `cli/convert.py` | done — three-phase per-subject pipeline (parallel dcm2niix → fmap rename + IntendedFor → atomic commit) |
+| Metadata | `metadata/` | **next** — port v0.2.5 `bids_metadata_engine.py` (`participants.tsv`, `*_scans.tsv`, README, sidecar audits) |
+| Validation | `editor/validator.py` | pending |
+| Project file | `project/` | pending — event-sourced JSON |
+| GUI | `gui/` | pending — Inspector layout, port from `inspector_proto/` |
 
-Suggested sequence to land before any GUI work:
+---
 
-1. `schema/` — port the basic API shape from
-   `../BIDS-Manager/bids_manager/schema_renamer.py` but rebuild it on
-   top of `bidsschematools` instead of inline rule tables.
-2. `inventory/types.py` — define `InventoryRow` (Pydantic model).
-3. `classifier/types.py` — define `Classification` (Pydantic).
-4. `classifier/dcm2niix_bidsguess.py` — M1.
-5. `inventory/mri_dicom.py` — port `dicom_inventory.scan_dicoms_long`
-   (preserve the 22-column TSV contract from `improvement_plan.md` §4).
-6. `cli/scan.py` — wire the above into a CLI verb that produces a TSV.
-7. Real-data test on
-   `/Users/karelo/Development/datasets/BIDS_Manager/raw_data/MRI/neuroimaging_unit_new`
-   confirming output identical to the v0.2.5 baseline.
+## Using the CLI
 
-After that loop is green, port `metadata/` (the existing
-`bids_metadata_engine.py` is mostly schema-aware already and ports
-nearly verbatim), then `converter/backends/dcm2niix_direct.py`, then
-the GUI. Don't start GUI work until the engine has at least one
-end-to-end CLI conversion working on real data.
+Two verbs cover the full pipeline today:
+
+```
+bidsmgr-scan    <dicom_root> <out.tsv> [--dataset NAME] [-j N] [--probe-convert]
+bidsmgr-convert <inventory.tsv> <bids_parent> [--dataset NAME] [-j N] [--overwrite] [--dry-run]
+```
+
+`<bids_parent>` is the **parent of dataset folders**. Each distinct
+`dataset` value in the inventory becomes a sibling BIDS root underneath
+it — so one inventory can produce multiple BIDS datasets in one run.
+
+### 1. Single-dataset workflow (the common case)
+
+```bash
+SRC=/Users/karelo/Development/datasets/BIDS_Manager/raw_data/MRI/neuroimaging_unit_new
+OUT=/Users/karelo/Development/datasets/BIDS_Manager/bids_manager_outputs/testing
+
+# Scan: walk DICOMs, classify, write the inventory TSV + files_by_uid sidecar.
+# --dataset defaults to a slug of the input dir basename ("neuroimaging_unit_new").
+bidsmgr-scan "$SRC" "$OUT/inventory.tsv" -j 10
+
+# Convert: read the TSV, run dcm2niix per series in parallel, post-conv fixups,
+# atomic commit per subject. Output lands at $OUT/converted/neuroimaging_unit_new/.
+bidsmgr-convert "$OUT/inventory.tsv" "$OUT/converted" -j 10
+```
+
+After the convert finishes:
+
+```
+$OUT/converted/neuroimaging_unit_new/
+├── dataset_description.json          ← created/appended on each run (GeneratedBy log)
+├── sub-001/
+│   ├── ses-pre/{anat,fmap,func}/
+│   ├── ses-post/{fmap,func}/
+│   └── .bidsmgr/provenance.json      ← per-subject record of what was converted
+├── sub-002/
+│   └── ...
+└── .bidsmgr/errors/                  ← only present if a subject failed
+```
+
+### 2. Splitting one inventory into multiple BIDS datasets
+
+The inventory TSV has a `dataset` column the user can edit (in any
+spreadsheet, or programmatically). To split subjects across two BIDS
+datasets:
+
+```bash
+# Edit $OUT/inventory.tsv: set dataset to "study_a" for some rows,
+# "study_b" for others. Save.
+
+bidsmgr-convert "$OUT/inventory.tsv" "$OUT/converted" -j 10
+# Produces:
+#   $OUT/converted/study_a/sub-XXX/...
+#   $OUT/converted/study_b/sub-YYY/...
+# Each with its own dataset_description.json.
+```
+
+Or, if you want to convert just one dataset from a multi-dataset inventory:
+
+```bash
+bidsmgr-convert "$OUT/inventory.tsv" "$OUT/converted" --dataset study_a -j 10
+```
+
+### 3. Override the dataset slug at scan time
+
+```bash
+bidsmgr-scan "$SRC" "$OUT/my_study.tsv" --dataset my_study -j 10
+```
+
+### 4. Preview without writing files
+
+```bash
+bidsmgr-convert "$OUT/inventory.tsv" "$OUT/converted" --dry-run
+# DRY: sub-001 ses-pre anat/sub-001_ses-pre_acq-tfl3p2_T1w (192 files)
+# DRY: sub-001 ses-pre func/sub-001_ses-pre_task-rest_bold (4500 files)
+# ...
+```
+
+### 5. Re-converting a subject that already exists
+
+By default, the converter refuses to clobber existing `sub-XXX/`
+folders and logs a warning. To replace them:
+
+```bash
+bidsmgr-convert "$OUT/inventory.tsv" "$OUT/converted" --overwrite -j 10
+# Existing sub-001/ moves to <bids_root>/.bidsmgr/backup/sub-001_<UTCstamp>/
+# before the new tree atomic-renames into place.
+```
+
+### 6. Inspecting outputs
+
+```bash
+# Conversion provenance (what got converted, dcm2niix returncodes, durations).
+cat "$OUT/converted/<dataset>/sub-001/.bidsmgr/provenance.json"
+
+# Run history (one entry per scan/convert invocation against this dataset).
+cat "$OUT/converted/<dataset>/dataset_description.json"
+
+# Error logs (only present when a subject failed mid-run).
+ls "$OUT/converted/<dataset>/.bidsmgr/errors/"
+```
+
+### What rules the conversion: the inventory TSV
+
+The TSV is the **single source of truth**. The converter never re-walks
+DICOMs — it reads the TSV and the sibling `files_by_uid` sidecar.
+Notable columns:
+
+| Column | Meaning |
+|---|---|
+| `include` | `1` = convert, `0` = skip. Auto-zeroed by scan for `repetition_type` ∈ {`suspected_abort`, `trivial`} and for classifier-rejected rows. |
+| `dataset` | User-editable BIDS dataset slug. Selects the output BIDS root. |
+| `proposed_basename` | The BIDS basename the converter passes to dcm2niix as `-f`. Built by the schema engine from the classifier's `(datatype, suffix, entities)` verdict. |
+| `proposed_datatype` | `anat` / `func` / `dwi` / `fmap` / `derivatives/...`. Selects the subdirectory under `sub-<id>[/ses-<label>]/`. |
+| `bids_guess_skip` | `True` if the BidsGuess classifier flagged the row as non-convertible. |
+| `repetition_type` | `isolated` / `planned` / `trivial` / `suspected_abort` — for run normalisation and abort detection. |
+| `proposed_issues` | Free-text list of any schema validation problems on the proposed name. |
+
+Edit `include` and `dataset` freely. `proposed_basename` and
+`proposed_datatype` come from the schema engine — overriding them is
+possible but bypasses validation, so prefer rerunning the scan after
+fixing the upstream classifier hint.
+
+---
+
+## Next feature
+
+**`metadata/` port** — port the v0.2.5 `bids_metadata_engine.py` onto
+the new `schema/` keystone. `bids_metadata_engine` is already mostly
+schema-aware, so this is largely mechanical. What it produces:
+
+- **`participants.tsv` + `participants.json`** — one row per converted
+  subject; columns derived from the inventory's demographic fields
+  (`PatientSex`, `PatientAge`, etc.) plus a JSON sidecar describing each.
+- **`*_scans.tsv`** per subject (or per session) — one row per converted
+  NIfTI with its `acq_time`. This is the file the existing
+  `fixups/scans_tsv.py` is wired to update; it's a no-op today because
+  no scans.tsv files exist yet.
+- **`README` + `CHANGES`** — minimal text scaffolds, append on rerun.
+- **Sidecar audit** — for every `(datatype, suffix)` pair under the BIDS
+  root, check the JSON sidecar against
+  `schema.required_sidecar_fields(datatype, suffix)` and report missing
+  required fields. Surfaces real DICOM gaps (missing
+  `RepetitionTime`, `EchoTime`, etc.) before downstream tools choke.
+
+Why this is the right next step:
+
+1. It closes the user-facing loop. After `metadata/` lands, a fresh
+   scan + convert run produces a **fully-populated, validator-ready
+   BIDS dataset** — no manual file-stuffing.
+2. The orchestrator (`cli/convert.py`) already has the per-subject
+   results in `provenance.json`; the metadata engine reads those plus
+   the on-disk tree to emit the dataset-level files. No Pipeline class —
+   add a `cli/metadata.py` verb that runs against a converted root.
+3. It activates `fixups/scans_tsv.py` (currently no-op).
+
+After `metadata/`: `editor/validator.py` (full BIDS validation), then
+`project/` (event-sourced project file so the GUI has something to load
+and modify), then GUI (port from `inspector_proto/`).
 
 ---
 

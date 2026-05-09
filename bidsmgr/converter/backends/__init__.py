@@ -1,22 +1,12 @@
 """Converter backend implementations.
 
 Each backend implements the ``ConverterBackend`` Protocol from
-``bidsmgr.converter.registry``:
+``bidsmgr.converter.registry``: ``name``, ``can_handle(task)``, and
+``convert(task, staging_dir) -> ConvertResult``.
 
-    class ConverterBackend(Protocol):
-        name: str
-        supported_modalities: set[Modality]
-        @classmethod
-        def can_handle(cls, plan) -> bool: ...
-        def convert(self, plans, dataset_root, progress) -> list[ConversionResult]: ...
+Modules:
+* ``dcm2niix_direct`` — default MRI backend.
 
-Modules planned:
-* ``dcm2niix_direct`` (default for MRI)
-* ``dcm2bids``        (optional)
-* ``heudiconv``       (optional, fork-pinned heudiconv-ancp)
-* ``mne_bids``        (EEG/MEG/iEEG)
-* ``bidsphysio``      (physio)
-* ``passthrough``     (already-BIDS files)
-
-Stub — not yet implemented.
+Planned later: ``dcm2bids``, ``heudiconv`` (heudiconv-ancp fork),
+``mne_bids`` (EEG/MEG/iEEG), ``bidsphysio``, ``passthrough``.
 """

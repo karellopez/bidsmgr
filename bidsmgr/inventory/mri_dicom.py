@@ -73,6 +73,11 @@ EXTENDED_COLUMNS: tuple[str, ...] = (
     "study_time",
 )
 
+# User-editable BIDS dataset name. Written by ``cli/scan.py``; read by
+# ``cli/convert.py`` to partition rows across sibling BIDS roots. The
+# converter writes each distinct value to ``<bids_parent>/<dataset>/``.
+DATASET_COLUMNS: tuple[str, ...] = ("dataset",)
+
 
 def is_dicom_file(path: str) -> bool:
     """Return True if ``path`` looks like a DICOM file.
@@ -206,6 +211,7 @@ def scan_dicoms_long(
     root_dir: str | os.PathLike,
     output_tsv: Optional[str | os.PathLike] = None,
     n_jobs: int = 1,
+    dataset: Optional[str] = None,
 ) -> pd.DataFrame:
     """Walk ``root_dir`` and return a long-format inventory DataFrame.
 
@@ -217,6 +223,11 @@ def scan_dicoms_long(
         If provided, write the inventory TSV to that path.
     n_jobs
         Number of parallel workers used to read DICOM headers.
+    dataset
+        User-supplied BIDS dataset slug stamped into every row's
+        ``dataset`` column. The converter uses this to partition subjects
+        across sibling BIDS roots. ``None`` leaves the column empty (the
+        CLI fills in a default before this function is called).
     """
 
     root_dir = Path(root_dir)
@@ -391,6 +402,10 @@ def scan_dicoms_long(
         if col not in df.columns:
             df[col] = ""
 
+    # Stamp the dataset slug across every row. ``None`` leaves it blank;
+    # the CLI orchestrator resolves a default and forwards it here.
+    df["dataset"] = dataset or ""
+
     if not df.empty:
         df.sort_values(["BIDS_name", "subject", "session", "acq_time"], inplace=True)
 
@@ -400,9 +415,11 @@ def scan_dicoms_long(
     # standard pandas ops (slicing, copy, to_csv).
     df.attrs["files_by_uid"] = {k: list(v) for k, v in files_by_uid.items()}
 
-    visible_columns = [c for c in TSV_COLUMNS if c in df.columns] + [
-        c for c in EXTENDED_COLUMNS if c in df.columns
-    ]
+    visible_columns = (
+        [c for c in TSV_COLUMNS if c in df.columns]
+        + [c for c in DATASET_COLUMNS if c in df.columns]
+        + [c for c in EXTENDED_COLUMNS if c in df.columns]
+    )
 
     if output_tsv:
         df.to_csv(output_tsv, sep="\t", index=False, columns=visible_columns)
