@@ -102,33 +102,44 @@ documented in `../improvement_plan.md` §12. Treat them as load-bearing:
 
 ## Current state
 
-The CLI loop **scan → convert** is implemented and validated end-to-end
-across all 10 reference MRI datasets (159 unit tests + 35 real-data
-tests, gated on `BIDS_MANAGER_REAL_MRI_DATA=1`).
+The full CLI loop **scan → rebuild → convert → metadata → validate** is
+implemented and end-to-end validated across **17 real datasets** (10 MRI
++ 6 EEG + 1 MEG). 336 unit tests + 49 real-data tests (gated on
+`BIDS_MANAGER_REAL_{MRI,EEG,MEG}_DATA=1`). The most recent comprehensive
+sweep ran every CLI verb on every dataset in 1386 s with **zero errors**
+and **zero BIDS-validator errors** in `--strict` mode.
 
 | Stage | Module(s) | Status |
 |---|---|---|
-| Scan | `inventory/`, `classifier/`, `cli/scan.py` | done — produces inventory TSV + `files_by_uid` sidecar |
-| Convert | `converter/`, `fixups/`, `cli/convert.py` | done — three-phase per-subject pipeline (parallel dcm2niix → fmap rename + IntendedFor → atomic commit) |
-| Metadata | `metadata/` | **next** — port v0.2.5 `bids_metadata_engine.py` (`participants.tsv`, `*_scans.tsv`, README, sidecar audits) |
-| Validation | `editor/validator.py` | pending |
-| Project file | `project/` | pending — event-sourced JSON |
-| GUI | `gui/` | pending — Inspector layout, port from `inspector_proto/` |
+| Scan | `inventory/`, `classifier/`, `cli/scan.py` | done — unified TSV (51 cols) + `files_by_uid` sidecar. Auto-detects DICOM vs EEG/MEG; multimodal trees produce one TSV. |
+| Rebuild | `inventory/rebuild.py`, `cli/rebuild.py` | done — bidirectional reconciliation between `entities` JSON and display cells. |
+| Convert | `converter/`, `fixups/`, `cli/convert.py` | done — per-subject staging + atomic commit. 3 backends: `Dcm2niixDirect`, `MneBidsBackend`, `PhysioDcmBackend`. Auto-rebuilds in memory before reading rows. |
+| Metadata | `metadata/`, `cli/metadata.py` | done — schema-driven engine. `dataset_description.json` (merge-not-clobber), `participants.tsv`+json, README, CHANGES, per-subject `*_scans.tsv`, sidecar audit, JSON report, optional `--fill-todos`. |
+| Validation | `editor/`, `cli/validate.py` | done — two-layer (schema + bidsschematools structural), severity-grouped HTML + JSON reports. Pydantic data structures shaped for the future GUI. |
+| Project file | `project/` | **pending** — event-sourced JSON for save/reload across sessions; prerequisite for the GUI. |
+| GUI | `gui/` | pending — Inspector layout port from `inspector_proto/` (theme + delegates already seeded). |
+| `fixups/derivatives.py` | small open gap | ~80 LOC — relocate DWI maps (FA/ADC/etc.) under `derivatives/dcm2niix/...`. Currently the converter skips `derivatives/` rows with a warning. |
 
 ---
 
 ## Using the CLI
 
-Two verbs cover the full pipeline today:
+Five verbs cover the whole pipeline:
 
 ```
-bidsmgr-scan    <dicom_root> <out.tsv> [--dataset NAME] [-j N] [--probe-convert]
-bidsmgr-convert <inventory.tsv> <bids_parent> [--dataset NAME] [-j N] [--overwrite] [--dry-run]
+bidsmgr-scan      <raw_root>     <inv.tsv>      [--dataset NAME] [--line-freq 50|60] [--montage NAME] [-j N] [--probe-convert]
+bidsmgr-rebuild   <inv.tsv>                     [--from {entities,columns}] [--dry-run]
+bidsmgr-convert   <inv.tsv>      <bids_parent>  [--dataset NAME] [-j N] [--overwrite] [--dry-run]
+bidsmgr-metadata  <bids_parent>                 [--inventory-tsv …] [--fill-todos] [--name …]
+bidsmgr-validate  <bids_parent>                 [--strict] [--strict-warn] [--html]
 ```
 
 `<bids_parent>` is the **parent of dataset folders**. Each distinct
 `dataset` value in the inventory becomes a sibling BIDS root underneath
-it — so one inventory can produce multiple BIDS datasets in one run.
+it — one inventory can produce multiple BIDS datasets in one run.
+
+`<raw_root>` for scan can mix DICOMs and raw EEG/MEG; the scanner
+auto-detects per file extension and emits one unified TSV.
 
 ### 1. Single-dataset workflow (the common case)
 
@@ -224,60 +235,59 @@ ls "$OUT/converted/<dataset>/.bidsmgr/errors/"
 ### What rules the conversion: the inventory TSV
 
 The TSV is the **single source of truth**. The converter never re-walks
-DICOMs — it reads the TSV and the sibling `files_by_uid` sidecar.
-Notable columns:
+DICOMs / raw EEG — it reads the TSV and the sibling `files_by_uid`
+sidecar (for MRI rows). The unified TSV has 51 columns; the
+user-editable / convert-sensitive ones are:
 
 | Column | Meaning |
 |---|---|
+| `entities` | **JSON object** of BIDS entities `{"subject":"001","session":"pre","task":"rest","run":"1",...}`. **The canonical source of truth for the BIDS basename.** Edit this and run `bidsmgr-rebuild` to regenerate `proposed_basename` + display cells. |
 | `include` | `1` = convert, `0` = skip. Auto-zeroed by scan for `repetition_type` ∈ {`suspected_abort`, `trivial`} and for classifier-rejected rows. |
 | `dataset` | User-editable BIDS dataset slug. Selects the output BIDS root. |
-| `proposed_basename` | The BIDS basename the converter passes to dcm2niix as `-f`. Built by the schema engine from the classifier's `(datatype, suffix, entities)` verdict. |
-| `proposed_datatype` | `anat` / `func` / `dwi` / `fmap` / `derivatives/...`. Selects the subdirectory under `sub-<id>[/ses-<label>]/`. |
+| `proposed_basename` | The BIDS basename. **Derived** from `entities`; `bidsmgr-rebuild` regenerates it. |
+| `proposed_datatype` | `anat` / `func` / `dwi` / `fmap` / `eeg` / `meg` / `ieeg`. Selects the subdirectory under `sub-<id>[/ses-<label>]/`. |
+| `task`, `run`, `session` | Mirror cells of the entities JSON. Edit these for a casual spreadsheet workflow, then `bidsmgr-rebuild --from columns` syncs the JSON. |
+| `line_freq` | EEG/MEG only — `PowerLineFrequency` (Hz). Defaulted from `--line-freq` at scan; per-row override. |
+| `montage` | EEG/MEG only — mne built-in montage name (`standard_1005`, `biosemi64`, …). Defaulted from `--montage` at scan; per-row override. Fills `electrodes.tsv` + `coordsystem.json`. |
 | `bids_guess_skip` | `True` if the BidsGuess classifier flagged the row as non-convertible. |
 | `repetition_type` | `isolated` / `planned` / `trivial` / `suspected_abort` — for run normalisation and abort detection. |
-| `proposed_issues` | Free-text list of any schema validation problems on the proposed name. |
 
-Edit `include` and `dataset` freely. `proposed_basename` and
-`proposed_datatype` come from the schema engine — overriding them is
-possible but bypasses validation, so prefer rerunning the scan after
-fixing the upstream classifier hint.
+**Two editing styles, both supported:**
+- *Power user*: edit the `entities` JSON cell → `bidsmgr-rebuild` (default `--from entities`) regenerates display cells.
+- *Spreadsheet user*: edit `task` / `run` / `session` cells → `bidsmgr-rebuild --from columns` syncs the JSON and regenerates the basename.
+
+Either way, `bidsmgr-convert` runs `rebuild_from_entities` in memory
+before reading rows, so the conversion always sees the freshest BIDS
+names even if you forgot to call rebuild.
 
 ---
 
-## Next feature
+## What's next
 
-**`metadata/` port** — port the v0.2.5 `bids_metadata_engine.py` onto
-the new `schema/` keystone. `bids_metadata_engine` is already mostly
-schema-aware, so this is largely mechanical. What it produces:
+The engine is complete for the CLI workflow. Remaining roadmap, in
+recommended order:
 
-- **`participants.tsv` + `participants.json`** — one row per converted
-  subject; columns derived from the inventory's demographic fields
-  (`PatientSex`, `PatientAge`, etc.) plus a JSON sidecar describing each.
-- **`*_scans.tsv`** per subject (or per session) — one row per converted
-  NIfTI with its `acq_time`. This is the file the existing
-  `fixups/scans_tsv.py` is wired to update; it's a no-op today because
-  no scans.tsv files exist yet.
-- **`README` + `CHANGES`** — minimal text scaffolds, append on rerun.
-- **Sidecar audit** — for every `(datatype, suffix)` pair under the BIDS
-  root, check the JSON sidecar against
-  `schema.required_sidecar_fields(datatype, suffix)` and report missing
-  required fields. Surfaces real DICOM gaps (missing
-  `RepetitionTime`, `EchoTime`, etc.) before downstream tools choke.
+1. **`project/` event-sourced project file** — JSON-event log that
+   captures user edits across `scan` → `rebuild` → `convert` → `metadata`
+   → `validate`, plus state like "subject Y was acknowledged at TODO
+   placeholders". Small (~300 LOC). Prerequisite for the GUI so the
+   user can save / reload work in progress.
+2. **GUI port** (`gui/`) — port the Inspector layout from
+   `inspector_proto/`. The theme + delegates + chip styles are already
+   seeded into `bidsmgr/gui/`. Validator already returns Pydantic
+   `ValidationReport` data shaped for the GUI's three panes (tree-badge
+   severities, schema-aware sidecar form, scoped issues panel).
+3. **`fixups/derivatives.py`** — small gap closer (~80 LOC) to relocate
+   DWI maps (FA, ADC, TRACE, ColFA, ExpADC) under
+   `derivatives/dcm2niix/...` instead of being skipped with a warning.
+4. **Cross-modality subject identity reconciliation** — currently each
+   modality scanner assigns its own sub-IDs. A study with the same
+   participant in MRI ("Alice" via PatientName) and EEG ("alice.edf")
+   ends up with different `BIDS_name` values per modality. Extend
+   `inventory/subject_identity.py` to align them post-scan.
 
-Why this is the right next step:
-
-1. It closes the user-facing loop. After `metadata/` lands, a fresh
-   scan + convert run produces a **fully-populated, validator-ready
-   BIDS dataset** — no manual file-stuffing.
-2. The orchestrator (`cli/convert.py`) already has the per-subject
-   results in `provenance.json`; the metadata engine reads those plus
-   the on-disk tree to emit the dataset-level files. No Pipeline class —
-   add a `cli/metadata.py` verb that runs against a converted root.
-3. It activates `fixups/scans_tsv.py` (currently no-op).
-
-After `metadata/`: `editor/validator.py` (full BIDS validation), then
-`project/` (event-sourced project file so the GUI has something to load
-and modify), then GUI (port from `inspector_proto/`).
+The CLI surface is stable; adding the project file format and the GUI
+is the path to a single-window experience.
 
 ---
 
