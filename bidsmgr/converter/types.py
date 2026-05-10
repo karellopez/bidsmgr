@@ -9,26 +9,34 @@ schema engine via the inventory TSV's ``proposed_basename`` column.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ConvertTask(BaseModel):
-    """One unit of conversion work — one DICOM series → one set of outputs.
+    """One unit of conversion work — one input series → one set of outputs.
 
-    Multi-output cases (fmap mag1+mag2+phasediff, DWI .nii.gz+.json+.bval+.bvec)
-    are still a single task. The fmap suffix mapping that turns dcm2niix's
-    ``_e1`` / ``_e2`` / ``_ph`` into the BIDS ``magnitude1`` / ``magnitude2``
-    / ``phasediff`` happens in ``fixups/fieldmaps.py``, after the backend
-    runs.
+    The ``source_files`` field carries the input paths the backend should
+    consume. Its concrete shape varies by modality:
+
+    * MRI (DICOM): potentially many files — every DICOM in the series.
+    * Physio (Siemens CMRR): one ``_PhysioLog.dcm``.
+    * EEG/MEG/iEEG: one recording file (or one folder for ``.ds``/``.mff``).
+
+    Multi-output conversion cases (fmap mag1+mag2+phasediff, DWI nii.gz+
+    json+bval+bvec, multi-rate physio) are still a single task — backends
+    report whatever files actually landed on disk via ``staged_files``.
+
+    For backwards compatibility the constructor accepts the old
+    ``source_dicom_files`` keyword and copies it into ``source_files``.
     """
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     row_id: str
     series_uid: str
-    source_dicom_files: tuple[Path, ...]
+    source_files: tuple[Path, ...]
     dataset: str
     bids_root: Path
     subject: str
@@ -39,6 +47,26 @@ class ConvertTask(BaseModel):
     basename: str
     expected_outputs: tuple[str, ...] = (".nii.gz", ".json")
     repetition_type: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_source_dicom_files(cls, data: Any) -> Any:
+        """Accept ``source_dicom_files`` (old name) as an alias.
+
+        Lets older test code construct tasks with the previous keyword
+        without immediately blowing up. Internally we always use
+        ``source_files``.
+        """
+        if isinstance(data, dict) and "source_files" not in data:
+            legacy = data.pop("source_dicom_files", None)
+            if legacy is not None:
+                data["source_files"] = legacy
+        return data
+
+    @property
+    def source_dicom_files(self) -> tuple[Path, ...]:
+        """Deprecated alias for :attr:`source_files`. Kept for compat."""
+        return self.source_files
 
 
 class ConvertResult(BaseModel):

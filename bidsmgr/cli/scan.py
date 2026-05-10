@@ -48,6 +48,7 @@ from ..classifier import dcm2niix_bidsguess, sequence_dict
 from ..classifier.types import Classification
 from ..inventory import probe_convert as probe_convert_module
 from ..inventory._time import parse_dicom_time_seconds as _parse_dicom_time_seconds
+from ..inventory.eeg_meg import EEG_MEG_COLUMNS, scan_eeg_meg
 from ..inventory.mri_dicom import (
     DATASET_COLUMNS,
     EXTENDED_COLUMNS,
@@ -956,6 +957,47 @@ def _default_dataset_slug(dicom_root: Path) -> str:
     return slug or "dataset"
 
 
+def _unified_column_order(df: pd.DataFrame) -> list[str]:
+    """Final unified TSV column order. Locked contract:
+
+    ``TSV(22) + BIDS_GUESS(8) + DATASET(1) + PROBE(4) + EXTENDED(3) + EEG_MEG(9) = 47``
+
+    Columns absent from ``df`` are skipped (so an MRI-only or EEG/MEG-only
+    inventory still validates).
+    """
+    return (
+        [c for c in TSV_COLUMNS if c in df.columns]
+        + [c for c in BIDS_GUESS_COLUMNS if c in df.columns]
+        + [c for c in DATASET_COLUMNS if c in df.columns]
+        + [c for c in PROBE_COLUMNS if c in df.columns]
+        + [c for c in EXTENDED_COLUMNS if c in df.columns]
+        + [c for c in EEG_MEG_COLUMNS if c in df.columns]
+    )
+
+
+def _finalize_unified_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Backfill missing columns with empty strings so the TSV is complete.
+
+    pandas' ``concat(sort=False)`` introduces NaN in cells where one
+    side didn't have the column. We replace those with ``""`` so the
+    TSV is clean and consumers don't have to special-case NaN. We also
+    ensure all unified-schema columns are present (even if empty).
+    """
+    all_cols = (
+        list(TSV_COLUMNS) + list(BIDS_GUESS_COLUMNS) + list(DATASET_COLUMNS)
+        + list(PROBE_COLUMNS) + list(EXTENDED_COLUMNS) + list(EEG_MEG_COLUMNS)
+    )
+    for col in all_cols:
+        if col not in df.columns:
+            df[col] = ""
+    return df.fillna("")
+
+
+def _empty_unified_dataframe() -> pd.DataFrame:
+    """Return an empty DataFrame with the unified column schema."""
+    return _finalize_unified_dataframe(pd.DataFrame())
+
+
 def _write_files_by_uid_sidecar(output_tsv: Path, files_by_uid: dict[str, list[str]]) -> Path:
     """Write ``<output_tsv>.files_by_uid.json.gz`` next to the inventory.
 
@@ -980,6 +1022,17 @@ def run_scan(
 ) -> pd.DataFrame:
     """Run the full scan pipeline and return the DataFrame written to TSV.
 
+    Walks ``dicom_root`` once for each enabled modality scanner:
+
+    * MRI scanner (``scan_dicoms_long``) — finds DICOM series.
+    * EEG/MEG scanner (``scan_eeg_meg``) — finds raw EEG/MEG/iEEG/NIRS.
+
+    Both branches run on the same input root; they look at non-
+    overlapping file types so both can find their own content even in
+    a multimodal study tree. Rows from each branch concatenate into one
+    unified TSV (modality-specific columns are blank for rows that
+    don't carry them).
+
     Parameters
     ----------
     n_jobs
@@ -996,7 +1049,7 @@ def run_scan(
         operator-aborted volume) surface in ``proposed_issues``. The
         ``.tmp/`` scratch tree is **always wiped** when ``run_scan``
         returns — including on error — so the user is left with the
-        inventory TSV and nothing else.
+        inventory TSV and nothing else. MRI rows only.
     """
 
     dataset_slug = dataset if dataset else _default_dataset_slug(dicom_root)
@@ -1005,12 +1058,28 @@ def run_scan(
         dicom_root, output_tsv=None, n_jobs=n_jobs, dataset=dataset_slug,
     )
 
+    # EEG/MEG branch: independent walk, merged at the end.
+    df_eeg = scan_eeg_meg(Path(dicom_root), dataset=dataset_slug)
+
+    if df.empty and df_eeg.empty:
+        log.warning("no DICOMs or EEG/MEG recordings found under %s", dicom_root)
+        empty = _empty_unified_dataframe()
+        empty.to_csv(output_tsv, sep="\t", index=False)
+        return empty
+
     if df.empty:
-        log.warning("no DICOMs found under %s", dicom_root)
+        # No MRI rows; just write the EEG/MEG rows in the unified shape.
         for col in BIDS_GUESS_COLUMNS:
-            df[col] = ""
-        df.to_csv(output_tsv, sep="\t", index=False)
-        return df
+            if col not in df_eeg.columns:
+                df_eeg[col] = ""
+        merged = _finalize_unified_dataframe(df_eeg)
+        merged.to_csv(output_tsv, sep="\t", index=False, columns=_unified_column_order(merged))
+        print(f"Inventory written to: {output_tsv}")
+        log.warning(
+            "no DICOMs found; the inventory has only EEG/MEG rows. "
+            "files_by_uid sidecar will not be written."
+        )
+        return merged
 
     rows = _rows_from_dataframe(df)
 
@@ -1064,32 +1133,38 @@ def run_scan(
                         )
 
     df = _augment_dataframe(df, rows, chosen, abort_verdicts, probe_stats)
-
     df.drop(columns=["_source_dir"], errors="ignore", inplace=True)
-    columns = (
-        [c for c in TSV_COLUMNS if c in df.columns]
-        + [c for c in BIDS_GUESS_COLUMNS if c in df.columns]
-        + [c for c in DATASET_COLUMNS if c in df.columns]
-        + [c for c in PROBE_COLUMNS if c in df.columns]
-        + [c for c in EXTENDED_COLUMNS if c in df.columns]
+
+    # Concatenate MRI + EEG/MEG rows into the unified shape. Columns that
+    # only one branch populates get filled with blanks for the other.
+    if not df_eeg.empty:
+        merged = pd.concat([df, df_eeg], ignore_index=True, sort=False)
+    else:
+        merged = df
+    merged = _finalize_unified_dataframe(merged)
+
+    merged.to_csv(
+        output_tsv, sep="\t", index=False,
+        columns=_unified_column_order(merged),
     )
-    df.to_csv(output_tsv, sep="\t", index=False, columns=columns)
     print(f"Inventory written to: {output_tsv}")
 
     # Always write the per-UID DICOM file map next to the TSV. ``bidsmgr-convert``
-    # reads this sidecar to find the source files for each row's dcm2niix call.
+    # reads this sidecar to find the source files for each MRI row's dcm2niix call.
+    # EEG/MEG rows store ``source_file`` directly in the TSV so they don't
+    # need this map.
     files_by_uid = df.attrs.get("files_by_uid", {})
     if files_by_uid:
         sidecar_path = _write_files_by_uid_sidecar(output_tsv, files_by_uid)
         print(f"files_by_uid sidecar written to: {sidecar_path}")
-    else:
+    elif (df["series_uid"] != "").any() if "series_uid" in df.columns else False:
         log.warning(
-            "df.attrs['files_by_uid'] is empty; the files_by_uid sidecar "
-            "was not written, and bidsmgr-convert will not be able to "
-            "convert this inventory."
+            "df.attrs['files_by_uid'] is empty but MRI rows are present; "
+            "bidsmgr-convert will not be able to convert MRI rows from "
+            "this inventory."
         )
 
-    return df
+    return merged
 
 
 def main(argv: Optional[list[str]] = None) -> int:

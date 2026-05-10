@@ -124,7 +124,7 @@ class TestCanHandle:
 
     def test_rejects_empty_source_files(self, tmp_path: Path) -> None:
         b = PhysioDcmBackend()
-        task = _make_task(tmp_path).model_copy(update={"source_dicom_files": ()})
+        task = _make_task(tmp_path).model_copy(update={"source_files": ()})
         assert b.can_handle(task) is False
 
 
@@ -136,9 +136,11 @@ class TestCanHandle:
 class TestRegistryDispatch:
     def test_default_backends_priority_order(self) -> None:
         backends = default_backends()
-        # Physio backend first (narrow match), then MRI fallback.
-        assert backends[0].name == "physio_dcm"
-        assert backends[1].name == "dcm2niix_direct"
+        # Priority: physio (narrowest), mne-bids (eeg/meg/ieeg/nirs),
+        # dcm2niix-direct (broad MRI fallback).
+        assert [b.name for b in backends] == [
+            "physio_dcm", "mne_bids", "dcm2niix_direct",
+        ]
 
     def test_physio_task_routes_to_physio_backend(self, tmp_path: Path) -> None:
         backends = default_backends()
@@ -247,7 +249,7 @@ class TestConvertFailure:
         b = PhysioDcmBackend()
         # All source files non-existent.
         task = _make_task(tmp_path).model_copy(
-            update={"source_dicom_files": (tmp_path / "nope.dcm",)},
+            update={"source_files": (tmp_path / "nope.dcm",)},
         )
         _patch_dcm2bids(
             monkeypatch,

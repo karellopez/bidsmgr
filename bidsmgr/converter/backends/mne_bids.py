@@ -1,0 +1,219 @@
+"""EEG / MEG / iEEG converter backend — wraps ``mne_bids.write_raw_bids``.
+
+The orchestrator (``cli/convert.py``) drives parallelism per task; this
+backend converts one recording per call. mne-bids does the heavy lifting:
+``write_raw_bids(format="auto")`` writes the data file plus
+``*_channels.tsv``, the datatype JSON sidecar, ``*_events.tsv``, and (when
+channel positions are present) ``*_electrodes.tsv`` + ``*_coordsystem.json``.
+Dataset-level metadata (``dataset_description.json``, ``participants.tsv``,
+README, CHANGES) is filled afterwards by ``bidsmgr-metadata`` — same flow
+as the MRI side.
+
+Reference: ported from
+``BIDS-Manager/bids_manager/run_mne_bids.py`` (v0.2.5), refactored
+to fit bidsmgr's per-task ``ConverterBackend`` Protocol.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Optional
+
+from ..types import ConvertResult, ConvertTask
+
+log = logging.getLogger(__name__)
+
+
+# Datatypes this backend claims. mne-bids supports these directly.
+_SUPPORTED_DATATYPES: frozenset[str] = frozenset({"eeg", "meg", "ieeg", "nirs"})
+
+
+class MneBidsBackend:
+    """Convert raw EEG/MEG/iEEG/NIRS recordings via mne-bids.
+
+    Stateless; safe to instantiate once and reuse across tasks. mne and
+    mne-bids are imported lazily inside :meth:`convert` so importing the
+    backend module is cheap even when those deps are missing.
+    """
+
+    name = "mne_bids"
+
+    def can_handle(self, task: ConvertTask) -> bool:
+        if task.datatype not in _SUPPORTED_DATATYPES:
+            return False
+        if not task.source_files or not task.basename:
+            return False
+        return True
+
+    def convert(self, task: ConvertTask, staging_dir: Path) -> ConvertResult:
+        t0 = time.monotonic()
+        try:
+            return self._convert_inner(task, staging_dir, t0)
+        except Exception as exc:
+            log.exception("mne_bids: unexpected error for %s", task.basename)
+            return ConvertResult(
+                task=task, success=False,
+                error=f"{type(exc).__name__}: {exc}",
+                duration_s=time.monotonic() - t0,
+            )
+
+    # ------------------------------------------------------------------
+    # internals
+    # ------------------------------------------------------------------
+
+    def _convert_inner(
+        self, task: ConvertTask, staging_dir: Path, t0: float,
+    ) -> ConvertResult:
+        # Lazy imports — mne is heavy. The pkg_resources warning from
+        # legacy mne / mne_bids versions is silenced for tidiness.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*pkg_resources.*")
+            try:
+                import mne
+                from mne_bids import BIDSPath, write_raw_bids
+            except ImportError as exc:
+                return ConvertResult(
+                    task=task, success=False,
+                    error=(
+                        "mne / mne-bids not installed; cannot convert "
+                        f"{task.datatype} row {task.basename!r}: {exc}"
+                    ),
+                    duration_s=time.monotonic() - t0,
+                )
+
+            # EEG/MEG tasks carry exactly one source file (or one folder
+            # for .ds/.mff). Pick the first; ignore extras defensively.
+            source = task.source_files[0]
+            if not source.exists():
+                return ConvertResult(
+                    task=task, success=False,
+                    error=f"source not found: {source}",
+                    duration_s=time.monotonic() - t0,
+                )
+
+            try:
+                raw = mne.io.read_raw(str(source), preload=False, verbose="ERROR")
+            except Exception as exc:
+                return ConvertResult(
+                    task=task, success=False,
+                    error=f"mne.io.read_raw failed: {type(exc).__name__}: {exc}",
+                    duration_s=time.monotonic() - t0,
+                )
+
+            # mne-bids writes ``sub-XXX/[ses-Y/]<datatype>/...`` *inside*
+            # its ``root``. The orchestrator hands us a per-subject (or
+            # per-session) staging dir; we need to walk up to the BIDS
+            # root so mne-bids doesn't produce ``sub-XXX/sub-XXX/...``.
+            bids_root_for_mne = _find_bids_root(staging_dir)
+            bids_root_for_mne.mkdir(parents=True, exist_ok=True)
+
+            bids_path = BIDSPath(
+                subject=task.subject,
+                session=task.session,
+                task=task.entities.get("task") or None,
+                run=_coerce_run(task.entities.get("run")),
+                datatype=task.datatype,
+                root=str(bids_root_for_mne),
+            )
+
+            try:
+                # ``overwrite=True`` lets sibling tasks for the same
+                # subject share metadata files (coordsystem.json,
+                # electrodes.tsv) without mne-bids' default "refuse to
+                # overwrite" guard rejecting later writes. The staging
+                # tree is fresh per convert run so we never clobber
+                # already-committed BIDS data — atomic-rename only
+                # promotes the staged sub-XXX into the live tree on
+                # success.
+                write_raw_bids(
+                    raw,
+                    bids_path,
+                    overwrite=True,
+                    format="auto",
+                    verbose="ERROR",
+                )
+            except Exception as exc:
+                return ConvertResult(
+                    task=task, success=False,
+                    error=(
+                        f"mne_bids.write_raw_bids failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    duration_s=time.monotonic() - t0,
+                )
+
+        # Collect outputs. mne-bids may emit:
+        #   <bids_root>/sub-X/[ses-Y/]<datatype>/sub-X..._<datatype>.<ext>
+        #   plus channels.tsv, datatype JSON, events.tsv, electrodes.tsv,
+        #   coordsystem.json.
+        sub_dir = bids_root_for_mne / f"sub-{task.subject}"
+        if task.session:
+            sub_dir = sub_dir / f"ses-{task.session}"
+        datatype_dir = sub_dir / task.datatype
+        if not datatype_dir.is_dir():
+            return ConvertResult(
+                task=task, success=False,
+                error=(
+                    f"mne_bids reported success but no {task.datatype} "
+                    f"output dir found at {datatype_dir}"
+                ),
+                duration_s=time.monotonic() - t0,
+            )
+        staged = sorted(datatype_dir.glob(f"sub-{task.subject}_*"))
+        if not staged:
+            return ConvertResult(
+                task=task, success=False,
+                error="mne_bids produced no output files",
+                duration_s=time.monotonic() - t0,
+            )
+
+        return ConvertResult(
+            task=task, staged_files=tuple(staged), success=True,
+            duration_s=time.monotonic() - t0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _find_bids_root(staging_dir: Path) -> Path:
+    """Walk up to the BIDS-root parent that mne-bids should populate.
+
+    The orchestrator passes a per-subject staging dir like
+    ``<...>/.tmp_bidsmgr/sub-001/`` or ``<...>/.tmp_bidsmgr/sub-001/ses-pre/``.
+    mne-bids writes ``sub-001/[ses-pre/]<datatype>/...`` inside its
+    ``root`` — so we need to feed it the parent of the ``sub-XXX``
+    component, not the ``sub-XXX`` directory itself.
+    """
+    p = Path(staging_dir)
+    if p.name.startswith("ses-") and p.parent.name.startswith("sub-"):
+        return p.parent.parent
+    if p.name.startswith("sub-"):
+        return p.parent
+    return p
+
+
+def _coerce_run(value: Any) -> Optional[int]:
+    """Best-effort int coercion for the ``run`` BIDS entity.
+
+    BIDS run is always an integer; a string ``"1"`` from the TSV becomes
+    ``1``, anything else returns ``None`` so mne-bids leaves the
+    ``_run-`` token off the BIDS path.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "n/a", "none"}:
+        return None
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+__all__ = ["MneBidsBackend"]

@@ -112,7 +112,7 @@ class TestCanHandle:
 
     def test_rejects_empty_source_files(self, tmp_path: Path) -> None:
         b = _backend(tmp_path)
-        task = _make_task(tmp_path).model_copy(update={"source_dicom_files": ()})
+        task = _make_task(tmp_path).model_copy(update={"source_files": ()})
         assert b.can_handle(task) is False
 
 
@@ -210,7 +210,7 @@ class TestConvertFailures:
         b = _backend(tmp_path)
         # All source files point at non-existent paths.
         task = _make_task(tmp_path).model_copy(
-            update={"source_dicom_files": (tmp_path / "nope" / "x.dcm",)},
+            update={"source_files": (tmp_path / "nope" / "x.dcm",)},
         )
         result = b.convert(task, tmp_path / "staging")
         assert result.success is False

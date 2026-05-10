@@ -40,12 +40,12 @@ class PhysioDcmBackend:
     def can_handle(self, task: ConvertTask) -> bool:
         if task.suffix != "physio":
             return False
-        if not task.source_dicom_files or not task.basename:
+        if not task.source_files or not task.basename:
             return False
         # Heuristic: at least one source file mentions physio in its
         # name. Keeps the backend from claiming non-CMRR rows that
         # accidentally classified to suffix=physio.
-        for fp in task.source_dicom_files:
+        for fp in task.source_files:
             name_lower = fp.name.lower()
             if "physio" in name_lower or "_physiolog" in name_lower:
                 return True
@@ -93,7 +93,7 @@ class PhysioDcmBackend:
                 )
 
             # bidsphysio expects a list of file paths (or a single path).
-            source_paths = [str(p) for p in task.source_dicom_files if p.exists()]
+            source_paths = [str(p) for p in task.source_files if p.exists()]
             if not source_paths:
                 return ConvertResult(
                     task=task, success=False,

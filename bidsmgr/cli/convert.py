@@ -35,6 +35,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -88,11 +89,18 @@ def run_convert(
             "regenerate the inventory with the new column."
         )
 
-    files_by_uid = _load_files_by_uid_sidecar(tsv)
-
     df = _filter_convertible_rows(df)
     if dataset:
         df = df[df["dataset"] == dataset].copy()
+
+    # The files_by_uid sidecar is only required when the inventory
+    # contains MRI rows. EEG/MEG-only inventories store the recording
+    # path in each row's ``source_file`` column.
+    has_mri_rows = (
+        "series_uid" in df.columns
+        and (df["series_uid"].astype(str).str.len() > 0).any()
+    )
+    files_by_uid = _load_files_by_uid_sidecar(tsv, required=has_mri_rows)
 
     if df.empty:
         log.warning("no rows to convert (after filtering)")
@@ -207,16 +215,24 @@ def _convert_subject(
         # Always wipe staging (success or fail; forensic data is in the error log).
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
-        # Try to remove the empty .tmp_bidsmgr container too. Strip any
-        # macOS-injected ``.DS_Store`` first so the directory can actually
-        # be removed when the user has been browsing it in Finder.
+        # Try to remove the empty .tmp_bidsmgr container too.
+        # mne-bids may have written dataset-level files there (README,
+        # dataset_description.json, participants.tsv/json) when it
+        # treated `.tmp_bidsmgr/` as its BIDS root for this subject —
+        # those are stale (the metadata module writes the canonical
+        # versions later at the real BIDS root). Strip them along with
+        # any macOS-injected ``.DS_Store`` before rmdir.
         tmp_root = bids_root / ".tmp_bidsmgr"
         if tmp_root.is_dir():
-            for stray in tmp_root.glob(".DS_Store"):
-                try:
-                    stray.unlink()
-                except OSError:
-                    pass
+            for stray in tmp_root.iterdir():
+                # Preserve any in-progress sub-* dirs (other subjects
+                # currently mid-conversion; sequential loop today, but
+                # be defensive). Remove plain files only.
+                if stray.is_file():
+                    try:
+                        stray.unlink()
+                    except OSError:
+                        pass
             try:
                 tmp_root.rmdir()
             except OSError:
@@ -364,6 +380,28 @@ def _row_to_task(
     bids_root: Path,
     files_by_uid: dict[str, list[str]],
 ) -> Optional[ConvertTask]:
+    """Detect MRI vs EEG/MEG row shape and dispatch to the right builder.
+
+    MRI rows have a non-empty ``series_uid``; EEG/MEG rows have a
+    non-empty ``source_file`` and a datatype in {eeg, meg, ieeg, nirs}.
+    Anything else returns None and the caller skips it.
+    """
+    series_uid = str(row.get("series_uid", "")).strip()
+    if series_uid:
+        return _row_to_task_mri(row, bids_root, files_by_uid)
+
+    source_file = str(row.get("source_file", "")).strip()
+    if source_file:
+        return _row_to_task_eeg_meg(row, bids_root)
+
+    return None
+
+
+def _row_to_task_mri(
+    row: pd.Series,
+    bids_root: Path,
+    files_by_uid: dict[str, list[str]],
+) -> Optional[ConvertTask]:
     series_uid = str(row.get("series_uid", "")).strip()
     if not series_uid:
         return None
@@ -426,7 +464,7 @@ def _row_to_task(
     return ConvertTask(
         row_id=series_uid,
         series_uid=series_uid,
-        source_dicom_files=tuple(Path(p) for p in files),
+        source_files=tuple(Path(p) for p in files),
         dataset=str(row.get("dataset", "")).strip(),
         bids_root=bids_root,
         subject=subject,
@@ -434,6 +472,103 @@ def _row_to_task(
         datatype=datatype,
         suffix=suffix,
         entities={},  # informational; backend doesn't read it
+        basename=basename,
+        expected_outputs=expected_outputs,
+        repetition_type=str(row.get("repetition_type", "")).strip(),
+    )
+
+
+def _row_to_task_eeg_meg(
+    row: pd.Series,
+    bids_root: Path,
+) -> Optional[ConvertTask]:
+    """Build a :class:`ConvertTask` for an EEG/MEG/iEEG/NIRS row.
+
+    EEG/MEG rows carry the recording's path directly in ``source_file``
+    (relative to the scan input root or absolute). The mne-bids backend
+    reads it via ``mne.io.read_raw`` and writes BIDS via
+    ``write_raw_bids``.
+    """
+    source_file = str(row.get("source_file", "")).strip()
+    if not source_file:
+        return None
+
+    bids_name = str(row.get("BIDS_name", "")).strip()
+    subject = bids_name[len("sub-"):] if bids_name.startswith("sub-") else bids_name
+    if not subject:
+        return None
+
+    raw_session = str(row.get("session", "")).strip()
+    session = (
+        raw_session[len("ses-"):] if raw_session.startswith("ses-")
+        else (raw_session or None)
+    )
+    if session == "":
+        session = None
+
+    datatype = str(row.get("proposed_datatype", "")).strip().lower()
+    if datatype not in {"eeg", "meg", "ieeg", "nirs"}:
+        # Either not actually an EEG/MEG row, or the user clobbered
+        # the column. Skip.
+        return None
+
+    suffix = (
+        str(row.get("bids_guess_suffix", "")).strip()
+        or _suffix_from_basename(str(row.get("proposed_basename", "")))
+        or datatype
+    )
+    basename = str(row.get("proposed_basename", "")).strip()
+    if not basename:
+        return None
+
+    # Resolve source_file to an absolute path. The scan TSV stores it
+    # relative to the scan input root; the convert input is the BIDS
+    # parent — different reference. Best effort: try as absolute first,
+    # then as path-relative-to-cwd.
+    src_path = Path(source_file)
+    if not src_path.is_absolute():
+        # Try common locations: cwd, then the TSV's parent dir.
+        candidates = [
+            Path.cwd() / src_path,
+            src_path.resolve(),
+        ]
+        for c in candidates:
+            if c.exists():
+                src_path = c
+                break
+
+    # Entities for BIDSPath construction in the backend.
+    entities: dict[str, str] = {}
+    task_value = str(row.get("task", "")).strip()
+    if task_value:
+        entities["task"] = task_value
+    # Run is sometimes encoded in the basename (run-N) or, for legacy
+    # rows, in a separate "run" column. Pull from either.
+    run_value = str(row.get("run", "")).strip()
+    if not run_value:
+        # Try to extract from basename: ``..._run-N_...``.
+        m = re.search(r"_run-(\d+)", basename)
+        if m:
+            run_value = m.group(1)
+    if run_value:
+        entities["run"] = run_value
+
+    # mne-bids writes the format-native data file (.edf / .vhdr / .fif /
+    # …) plus channels.tsv + datatype JSON. We don't validate the exact
+    # extension — the backend collects whatever lands in the datatype dir.
+    expected_outputs: tuple[str, ...] = (".json",)
+
+    return ConvertTask(
+        row_id=source_file,  # source path is unique per recording
+        series_uid="",       # blank for EEG/MEG rows
+        source_files=(src_path,),
+        dataset=str(row.get("dataset", "")).strip(),
+        bids_root=bids_root,
+        subject=subject,
+        session=session,
+        datatype=datatype,
+        suffix=suffix,
+        entities=entities,
         basename=basename,
         expected_outputs=expected_outputs,
         repetition_type=str(row.get("repetition_type", "")).strip(),
@@ -452,13 +587,24 @@ def _suffix_from_basename(basename: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _load_files_by_uid_sidecar(tsv: Path) -> dict[str, list[str]]:
+def _load_files_by_uid_sidecar(
+    tsv: Path, *, required: bool = True,
+) -> dict[str, list[str]]:
+    """Load the per-UID DICOM file map.
+
+    Required for inventories with MRI rows (``series_uid`` populated).
+    EEG/MEG-only inventories don't need this sidecar — the recording
+    paths live in each row's ``source_file`` column. Pass
+    ``required=False`` for those cases; missing sidecar returns ``{}``.
+    """
     sidecar = tsv.with_suffix(tsv.suffix + ".files_by_uid.json.gz")
     if not sidecar.exists():
-        raise FileNotFoundError(
-            f"missing files_by_uid sidecar: {sidecar} — "
-            "re-run `bidsmgr-scan` to produce it next to the inventory TSV"
-        )
+        if required:
+            raise FileNotFoundError(
+                f"missing files_by_uid sidecar: {sidecar} — "
+                "re-run `bidsmgr-scan` to produce it next to the inventory TSV"
+            )
+        return {}
     with gzip.open(sidecar, "rb") as fh:
         return json.loads(fh.read().decode("utf-8"))
 
@@ -522,7 +668,7 @@ def _write_provenance(
                 "suffix": r.task.suffix,
                 "basename": r.task.basename,
                 "outputs": [p.name for p in r.staged_files],
-                "n_input_dicoms": len(r.task.source_dicom_files),
+                "n_input_dicoms": len(r.task.source_files),
                 "success": r.success,
                 "error": r.error,
                 "dcm2niix_returncode": r.dcm2niix_returncode,

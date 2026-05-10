@@ -69,14 +69,18 @@ class Dcm2niixDirect:
             # Physio rows route to ``PhysioDcmBackend`` (bidsphysio
             # wrapper). dcm2niix can't produce ``_physio.tsv.gz``.
             return False
-        return bool(task.source_dicom_files) and bool(task.basename)
+        if task.datatype in {"eeg", "meg", "ieeg", "nirs"}:
+            # EEG/MEG/iEEG/NIRS rows route to ``MneBidsBackend``.
+            # dcm2niix doesn't read raw electrophysiology formats.
+            return False
+        return bool(task.source_files) and bool(task.basename)
 
     def convert(self, task: ConvertTask, staging_dir: Path) -> ConvertResult:
         """Run dcm2niix for one series; report what landed in staging.
 
         Failure modes captured in ``ConvertResult.error``:
 
-        * ``"empty staging"`` — none of ``task.source_dicom_files`` exist.
+        * ``"empty staging"`` — none of ``task.source_files`` exist.
         * ``"dcm2niix failed: rc=<n>"`` — dcm2niix exited non-zero.
         * ``"missing expected output: <ext>"`` — required extension
           (``.nii.gz`` or ``.json``) absent after a 0-exit run.
@@ -114,7 +118,7 @@ class Dcm2niixDirect:
         # series) live alongside the datatype tree so nothing collides
         # when multiple tasks for the same subject run in parallel.
         dicoms_dir = staging_dir / f"_dicoms_{task.series_uid}"
-        n_staged = _stage_dicoms(task.source_dicom_files, dicoms_dir)
+        n_staged = _stage_dicoms(task.source_files, dicoms_dir)
         if n_staged == 0:
             return ConvertResult(
                 task=task, success=False,

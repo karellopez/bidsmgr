@@ -46,14 +46,22 @@ def default_backends(
     """Return the priority-ordered list of registered backends.
 
     Narrower matches go first. Lazy imports keep modules with heavy
-    optional deps (bidsphysio's pkg_resources warning, dcm2niix
+    optional deps (bidsphysio's pkg_resources warning, mne, dcm2niix
     discovery) out of the import path until actually used.
+
+    Order: ``PhysioDcmBackend`` (suffix=physio narrow match) →
+    ``MneBidsBackend`` (datatype ∈ eeg/meg/ieeg/nirs) →
+    ``Dcm2niixDirect`` (broad MRI fallback). Each upstream backend's
+    ``can_handle`` declines the others' datatypes so the dispatch is
+    unambiguous.
     """
     from .backends.dcm2niix_direct import Dcm2niixDirect
+    from .backends.mne_bids import MneBidsBackend
     from .backends.physio_dcm import PhysioDcmBackend
 
     return [
         PhysioDcmBackend(),
+        MneBidsBackend(),
         Dcm2niixDirect(dcm2niix_bin=dcm2niix_bin),
     ]
 
