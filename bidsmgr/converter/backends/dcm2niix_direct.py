@@ -65,6 +65,10 @@ class Dcm2niixDirect:
         return self._bin
 
     def can_handle(self, task: ConvertTask) -> bool:
+        if task.suffix == "physio":
+            # Physio rows route to ``PhysioDcmBackend`` (bidsphysio
+            # wrapper). dcm2niix can't produce ``_physio.tsv.gz``.
+            return False
         return bool(task.source_dicom_files) and bool(task.basename)
 
     def convert(self, task: ConvertTask, staging_dir: Path) -> ConvertResult:

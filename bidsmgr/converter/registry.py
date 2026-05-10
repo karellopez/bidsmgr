@@ -1,8 +1,18 @@
-"""Backend registry — selects a converter for a given modality.
+"""Backend registry — selects a converter for a given task.
 
 Reference: architecture.md §7. The registry is in-tree for v1
-(decisions log §13: "in-tree registry; entry-points later"). Adding a
-new backend means importing it here and extending ``select_backend``.
+(decisions log §13: "in-tree registry; entry-points later"). Each
+backend declares ``can_handle(task: ConvertTask) -> bool``; the
+orchestrator asks each in priority order and the first match wins.
+
+Today's roster (priority order — narrower matches first):
+
+* ``PhysioDcmBackend`` — claims rows whose ``suffix == "physio"`` that
+  look like Siemens CMRR ``_PhysioLog.dcm`` outputs. Wraps
+  ``bidsphysio.dcm2bidsphysio``.
+* ``Dcm2niixDirect`` — broad MRI fallback. Claims everything else.
+
+Future: ``mne_bids`` (EEG/MEG/iEEG), ``passthrough`` (already-BIDS).
 """
 
 from __future__ import annotations
@@ -30,19 +40,57 @@ class ConverterBackend(Protocol):
     def convert(self, task: ConvertTask, staging_dir: Path) -> ConvertResult: ...
 
 
-def select_backend(modality: Modality, *, dcm2niix_bin: Optional[Path] = None) -> ConverterBackend:
-    """Return a backend instance suitable for ``modality``.
+def default_backends(
+    *, dcm2niix_bin: Optional[Path] = None,
+) -> list[ConverterBackend]:
+    """Return the priority-ordered list of registered backends.
 
-    Raises ``NotImplementedError`` for modalities without a backend yet
-    (EEG/MEG/iEEG/PET/physio/NIRS land later).
+    Narrower matches go first. Lazy imports keep modules with heavy
+    optional deps (bidsphysio's pkg_resources warning, dcm2niix
+    discovery) out of the import path until actually used.
+    """
+    from .backends.dcm2niix_direct import Dcm2niixDirect
+    from .backends.physio_dcm import PhysioDcmBackend
+
+    return [
+        PhysioDcmBackend(),
+        Dcm2niixDirect(dcm2niix_bin=dcm2niix_bin),
+    ]
+
+
+def dispatch(
+    backends: list[ConverterBackend], task: ConvertTask,
+) -> ConverterBackend:
+    """Pick the first backend whose ``can_handle(task)`` returns ``True``.
+
+    Raises ``LookupError`` when no backend matches — the orchestrator
+    converts that into a per-task ``ConvertResult`` so a single
+    unmatched row doesn't abort the whole subject.
+    """
+    for backend in backends:
+        if backend.can_handle(task):
+            return backend
+    raise LookupError(
+        f"no backend can handle task {task.basename!r} "
+        f"(suffix={task.suffix!r})"
+    )
+
+
+def select_backend(
+    modality: Modality, *, dcm2niix_bin: Optional[Path] = None,
+) -> ConverterBackend:
+    """Modality-keyed selector kept for backward compatibility.
+
+    Returns the *primary* backend for the modality. Most callers should
+    use :func:`default_backends` + :func:`dispatch` instead so that
+    physio rows route to the physio backend.
     """
     if modality == "mri":
-        # Imported lazily so importing the registry doesn't pull in the
-        # backend's dependencies (subprocess, dcm2niix discovery, …).
         from .backends.dcm2niix_direct import Dcm2niixDirect
-
         return Dcm2niixDirect(dcm2niix_bin=dcm2niix_bin)
     raise NotImplementedError(f"No converter backend for modality={modality!r}")
 
 
-__all__ = ["ConverterBackend", "select_backend"]
+__all__ = [
+    "ConverterBackend", "default_backends", "dispatch", "select_backend",
+]

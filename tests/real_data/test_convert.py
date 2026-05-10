@@ -160,3 +160,33 @@ class TestConvertNeuroimagingUnitNew:
             assert (parent / f"{stem}.bval").exists(), f"missing bval for {nii.name}"
             assert (parent / f"{stem}.bvec").exists(), f"missing bvec for {nii.name}"
             assert (parent / f"{stem}.json").exists(), f"missing json for {nii.name}"
+
+    def test_physio_outputs_via_bidsphysio(
+        self, neuroimaging_unit_new_artifacts,
+    ) -> None:
+        """Siemens CMRR ``_PhysioLog.dcm`` rows produce ``_physio.tsv.gz`` +
+        ``_physio.json`` pairs in the same dir as the imaging data they
+        accompany. Drives the ``PhysioDcmBackend`` end-to-end through
+        the per-task dispatcher."""
+        import json as _json
+
+        _, dataset_root = neuroimaging_unit_new_artifacts
+        physio_niftis = list(dataset_root.rglob("*_physio.tsv.gz"))
+        if not physio_niftis:
+            pytest.skip("no physio rows in this fixture run")
+        for tsv in physio_niftis:
+            stem = tsv.name[: -len(".tsv.gz")]
+            sidecar = tsv.parent / f"{stem}.json"
+            assert sidecar.exists(), f"missing JSON sidecar for {tsv.name}"
+            data = _json.loads(sidecar.read_text())
+            # BIDS spec: physio JSON must declare these three keys.
+            assert "SamplingFrequency" in data, f"{sidecar.name}: missing SamplingFrequency"
+            assert "StartTime" in data, f"{sidecar.name}: missing StartTime"
+            assert "Columns" in data, f"{sidecar.name}: missing Columns"
+            assert isinstance(data["Columns"], list)
+            assert data["SamplingFrequency"] > 0
+            # Physio outputs land in func/ (or beh/ etc.) of the
+            # accompanying imaging data, not in a separate top-level dir.
+            assert tsv.parent.name in {"func", "dwi", "anat", "perf"}, (
+                f"unexpected physio location: {tsv.parent}"
+            )

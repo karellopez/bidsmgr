@@ -47,7 +47,13 @@ from joblib import Parallel, delayed
 
 import bidsmgr
 
-from ..converter import ConvertResult, ConvertTask, select_backend
+from ..converter import (
+    ConvertResult,
+    ConvertTask,
+    default_backends,
+    dispatch,
+    select_backend,
+)
 from ..fixups import apply_fieldmap_renames, populate_intended_for, update_scans_tsv
 
 log = logging.getLogger(__name__)
@@ -92,8 +98,11 @@ def run_convert(
         log.warning("no rows to convert (after filtering)")
         return 0
 
-    backend = select_backend("mri", dcm2niix_bin=dcm2niix_bin)
-    dcm2niix_version = _dcm2niix_version_string(backend.binary)
+    backends = default_backends(dcm2niix_bin=dcm2niix_bin)
+    # Capture dcm2niix version once for provenance — it's still the
+    # primary backend for MRI rows.
+    primary = select_backend("mri", dcm2niix_bin=dcm2niix_bin)
+    dcm2niix_version = _dcm2niix_version_string(primary.binary)
 
     n_failed = 0
     for dataset_name, dataset_df in df.groupby("dataset"):
@@ -123,7 +132,7 @@ def run_convert(
 
             try:
                 _convert_subject(
-                    tasks, bids_root, backend,
+                    tasks, bids_root, backends,
                     n_jobs=n_jobs, overwrite=overwrite,
                     dcm2niix_version=dcm2niix_version,
                 )
@@ -142,7 +151,7 @@ def run_convert(
 def _convert_subject(
     tasks: list[ConvertTask],
     bids_root: Path,
-    backend,
+    backends: list,
     *,
     n_jobs: int,
     overwrite: bool,
@@ -158,9 +167,9 @@ def _convert_subject(
     exception_obj: Optional[BaseException] = None
 
     try:
-        # Phase 1: parallel per-series dcm2niix.
+        # Phase 1: parallel per-series dispatch + conversion.
         results = _phase1_parallel_dcm2niix(
-            tasks, staging, backend, n_jobs=n_jobs,
+            tasks, staging, backends, n_jobs=n_jobs,
         )
 
         # Phase 2: per-subject post-conv (sequential, fast).
@@ -226,37 +235,47 @@ def _convert_subject(
 def _phase1_parallel_dcm2niix(
     tasks: list[ConvertTask],
     staging: Path,
-    backend,
+    backends: list,
     *,
     n_jobs: int,
 ) -> list[ConvertResult]:
-    """Run dcm2niix per series in parallel; return per-task results."""
-    if n_jobs == 1 or len(tasks) == 1:
-        return [_phase1_one(backend, t, staging) for t in tasks]
+    """Run per-series conversion in parallel; return per-task results.
 
-    # joblib's loky backend forks workers; the backend, task, and staging
-    # path are picklable. We use threading for tiny task lists to skip
-    # the fork overhead, loky otherwise.
+    Backend selection is per-task: each task is dispatched to the
+    first registered backend whose ``can_handle()`` returns True.
+    """
+    if n_jobs == 1 or len(tasks) == 1:
+        return [_phase1_one(backends, t, staging) for t in tasks]
+
     parallel_backend = "threading" if len(tasks) < 4 else "loky"
     return Parallel(n_jobs=n_jobs, backend=parallel_backend)(
-        delayed(_phase1_one)(backend, t, staging) for t in tasks
+        delayed(_phase1_one)(backends, t, staging) for t in tasks
     )
 
 
-def _phase1_one(backend, task: ConvertTask, staging: Path) -> ConvertResult:
-    """Picklable single-task wrapper. Catches any backend exception.
+def _phase1_one(backends: list, task: ConvertTask, staging: Path) -> ConvertResult:
+    """Picklable single-task wrapper.
 
-    The ``staging`` arg is the per-subject root; this wrapper picks the
-    session subdir (when the task has a session) so the backend writes
-    to ``<staging>/ses-<label>/<datatype>/`` which is the final BIDS
-    layout under the subject root.
+    Dispatches to the first matching backend per :func:`dispatch`.
+    Catches any exception so a single bad task doesn't take down the
+    whole subject.
+
+    ``staging`` is the per-subject root; this wrapper picks the session
+    subdir (when the task has a session) so the backend writes to
+    ``<staging>/ses-<label>/<datatype>/``.
     """
     target_root = staging if not task.session else staging / f"ses-{task.session}"
     target_root.mkdir(parents=True, exist_ok=True)
     try:
+        backend = dispatch(backends, task)
+    except LookupError as exc:
+        return ConvertResult(
+            task=task, success=False, error=str(exc),
+        )
+    try:
         return backend.convert(task, target_root)
     except Exception as exc:
-        log.exception("backend raised for %s", task.basename)
+        log.exception("backend %s raised for %s", backend.name, task.basename)
         return ConvertResult(
             task=task, success=False,
             error=f"{type(exc).__name__}: {exc}",
@@ -393,20 +412,16 @@ def _row_to_task(
         )
         return None
 
-    # dcm2niix can't produce physio outputs. Physio data flows through
-    # bidsphysio (separate backend, not yet ported). Skip those rows so
-    # the convert log isn't polluted with rc=2 noise.
-    if suffix == "physio" or basename.endswith("_physio"):
-        log.info(
-            "row series=%s is physio (%s); skipping (dcm2niix-direct does "
-            "not handle physio; bidsphysio backend lands later)",
-            series_uid, basename,
-        )
-        return None
-
-    expected_outputs = (".nii.gz", ".json")
-    if suffix == "dwi":
+    # Expected outputs differ by suffix. Physio rows produce
+    # ``.tsv.gz`` + ``.json`` from the bidsphysio backend; everything
+    # else dcm2niix-direct handles produces ``.nii.gz`` + ``.json``,
+    # plus DWI extras.
+    if suffix == "physio":
+        expected_outputs = (".tsv.gz", ".json")
+    elif suffix == "dwi":
         expected_outputs = (".nii.gz", ".json", ".bval", ".bvec")
+    else:
+        expected_outputs = (".nii.gz", ".json")
 
     return ConvertTask(
         row_id=series_uid,

@@ -9,7 +9,10 @@ Default backend: ``dcm2niix_direct`` (MRI). dcm2bids and heudiconv ship
 as optional plugins later.
 """
 
-from .registry import ConverterBackend, select_backend
+from .registry import ConverterBackend, default_backends, dispatch, select_backend
 from .types import ConvertResult, ConvertTask
 
-__all__ = ["ConverterBackend", "ConvertResult", "ConvertTask", "select_backend"]
+__all__ = [
+    "ConverterBackend", "ConvertResult", "ConvertTask",
+    "default_backends", "dispatch", "select_backend",
+]
