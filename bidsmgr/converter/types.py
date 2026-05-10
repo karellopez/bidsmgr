@@ -48,6 +48,12 @@ class ConvertTask(BaseModel):
     expected_outputs: tuple[str, ...] = (".nii.gz", ".json")
     repetition_type: str = ""
 
+    # EEG/MEG-specific: per-row knobs that the inventory TSV carries.
+    # Backends consult these when present; the CLI passes its own
+    # default so blank cells fall back to the dataset-wide value.
+    line_freq: Optional[float] = None
+    montage: Optional[str] = None
+
     @model_validator(mode="before")
     @classmethod
     def _accept_legacy_source_dicom_files(cls, data: Any) -> Any:

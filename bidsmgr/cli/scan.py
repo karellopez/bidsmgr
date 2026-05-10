@@ -50,6 +50,7 @@ from ..inventory import probe_convert as probe_convert_module
 from ..inventory._time import parse_dicom_time_seconds as _parse_dicom_time_seconds
 from ..inventory.eeg_meg import EEG_MEG_COLUMNS, scan_eeg_meg
 from ..inventory.mri_dicom import (
+    BIDS_ENTITIES_COLUMNS,
     DATASET_COLUMNS,
     EXTENDED_COLUMNS,
     TSV_COLUMNS,
@@ -610,28 +611,27 @@ def _propose_basename(
     bids_name: str,
     session: str,
     classification: Classification,
-) -> tuple[str, str, list[str]]:
-    """Return ``(datatype_or_path, basename, issues)`` for a classification.
+) -> tuple[str, str, list[str], dict[str, str]]:
+    """Return ``(datatype_or_path, basename, issues, entities)`` for a classification.
 
     For raw BIDS classifications, the first tuple element is the datatype
     name (``anat`` / ``func`` / ``dwi`` / ``fmap`` / ``perf`` / …).
 
     For ``classification.datatype == "derivatives"``, the first element is
     the *full* relative directory path (``derivatives/<pipeline>/sub-XXX``
-    or ``derivatives/<pipeline>/sub-XXX/ses-Y/dwi``) — the converter
-    backend writes the file there. The basename uses ``_desc-<SUFFIX>_dwi``
-    so the actual filename remains valid BIDS-derivatives.
+    or ``derivatives/<pipeline>/sub-XXX/ses-Y/dwi``).
 
-    ``issues`` is a list of human-readable validation messages; an empty
-    list means the proposal is schema-valid and ready to commit.
-    Skip / discard rows return empty datatype/basename and no issues.
+    The ``entities`` dict is the canonical entity set used to build the
+    basename. The CLI stores it in the row's ``entities`` column as JSON
+    so ``bidsmgr-rebuild`` can regenerate the basename later if the
+    user edits any entity.
     """
 
     if classification.skip or classification.datatype == "discard":
-        return ("", "", [])
+        return ("", "", [], {})
 
     if not bids_name:
-        return ("", "", ["BIDS_name missing"])
+        return ("", "", ["BIDS_name missing"], {})
 
     entities = dict(classification.candidate_entities)
     entities.pop("subject", None)
@@ -643,7 +643,8 @@ def _propose_basename(
     suffix = classification.suffix
 
     if datatype == "derivatives":
-        return _propose_derivatives_basename(entities, suffix)
+        d, b, i = _propose_derivatives_basename(entities, suffix)
+        return d, b, i, entities
 
     # Strip entities the schema doesn't allow for this (datatype, suffix).
     allowed = set(schema.allowed_entities(datatype, suffix))
@@ -655,9 +656,6 @@ def _propose_basename(
     errors = [v for v in verdicts if v.severity is schema.Severity.ERROR]
     issues = [f"{v.rule_id}: {v.message}" for v in errors]
 
-    # Best-effort: emit a basename even if schema-invalid by inserting
-    # placeholder values for required entities so the user gets something
-    # to look at. Placeholders are flagged via ``issues``.
     if errors:
         for ent in schema.required_entities(datatype, suffix):
             if not entities.get(ent):
@@ -667,9 +665,9 @@ def _propose_basename(
         basename = schema.build_basename(entities, datatype, suffix)
     except (ValueError, KeyError) as exc:
         log.debug("could not build basename from %s: %s", classification, exc)
-        return (datatype, "", issues + [f"build_basename: {exc}"])
+        return (datatype, "", issues + [f"build_basename: {exc}"], entities)
 
-    return datatype, basename, issues
+    return datatype, basename, issues, entities
 
 
 def _propose_derivatives_basename(
@@ -777,7 +775,9 @@ def _augment_dataframe(
 
         bids_name = str(df.at[df_idx, "BIDS_name"] or "").replace("sub-", "")
         session = str(df.at[df_idx, "session"] or "").replace("ses-", "")
-        datatype, basename, issues = _propose_basename(bids_name, session, best)
+        datatype, basename, issues, entities_used = _propose_basename(
+            bids_name, session, best,
+        )
 
         # Repetition verdict: "isolated" (singleton group), "trivial"
         # (sub-derivative output), "planned" (intentional repeat), or
@@ -859,6 +859,13 @@ def _augment_dataframe(
             df.at[df_idx, "proposed_datatype"] = datatype
             df.at[df_idx, "proposed_basename"] = basename
             df.at[df_idx, "Proposed BIDS name"] = f"{datatype}/{basename}{ext}"
+
+        # Record the canonical entities dict used to build the basename
+        # in JSON so ``bidsmgr-rebuild`` can regenerate the basename
+        # after the user edits an entity here. ``sort_keys`` keeps the
+        # cell stable across reruns for clean diffs.
+        if entities_used:
+            df.at[df_idx, "entities"] = json.dumps(entities_used, sort_keys=True)
 
         # Probe-convert columns + anomaly detection. Aggregate every
         # probe stat across the underlying UIDs of this DataFrame row
@@ -960,7 +967,13 @@ def _default_dataset_slug(dicom_root: Path) -> str:
 def _unified_column_order(df: pd.DataFrame) -> list[str]:
     """Final unified TSV column order. Locked contract:
 
-    ``TSV(22) + BIDS_GUESS(8) + DATASET(1) + PROBE(4) + EXTENDED(3) + EEG_MEG(9) = 47``
+    ``TSV(22) + BIDS_GUESS(8) + ENTITIES(1) + DATASET(1) + PROBE(4) +
+    EXTENDED(3) + EEG_MEG(12) = 51``.
+
+    The ``entities`` column carries the canonical JSON-encoded BIDS
+    entity dict; the converter and ``bidsmgr-rebuild`` use it as the
+    source of truth. Display columns (``proposed_basename``, ``task``,
+    ``run`` …) are derived from it.
 
     Columns absent from ``df`` are skipped (so an MRI-only or EEG/MEG-only
     inventory still validates).
@@ -968,6 +981,7 @@ def _unified_column_order(df: pd.DataFrame) -> list[str]:
     return (
         [c for c in TSV_COLUMNS if c in df.columns]
         + [c for c in BIDS_GUESS_COLUMNS if c in df.columns]
+        + [c for c in BIDS_ENTITIES_COLUMNS if c in df.columns]
         + [c for c in DATASET_COLUMNS if c in df.columns]
         + [c for c in PROBE_COLUMNS if c in df.columns]
         + [c for c in EXTENDED_COLUMNS if c in df.columns]
@@ -984,8 +998,9 @@ def _finalize_unified_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     ensure all unified-schema columns are present (even if empty).
     """
     all_cols = (
-        list(TSV_COLUMNS) + list(BIDS_GUESS_COLUMNS) + list(DATASET_COLUMNS)
-        + list(PROBE_COLUMNS) + list(EXTENDED_COLUMNS) + list(EEG_MEG_COLUMNS)
+        list(TSV_COLUMNS) + list(BIDS_GUESS_COLUMNS) + list(BIDS_ENTITIES_COLUMNS)
+        + list(DATASET_COLUMNS) + list(PROBE_COLUMNS) + list(EXTENDED_COLUMNS)
+        + list(EEG_MEG_COLUMNS)
     )
     for col in all_cols:
         if col not in df.columns:
@@ -1019,6 +1034,8 @@ def run_scan(
     skip_bids_guess: bool = False,
     probe_convert: bool = False,
     dataset: Optional[str] = None,
+    line_freq: Optional[float] = None,
+    montage: Optional[str] = None,
 ) -> pd.DataFrame:
     """Run the full scan pipeline and return the DataFrame written to TSV.
 
@@ -1059,7 +1076,12 @@ def run_scan(
     )
 
     # EEG/MEG branch: independent walk, merged at the end.
-    df_eeg = scan_eeg_meg(Path(dicom_root), dataset=dataset_slug)
+    df_eeg = scan_eeg_meg(
+        Path(dicom_root),
+        dataset=dataset_slug,
+        line_freq=line_freq,
+        montage=montage,
+    )
 
     if df.empty and df_eeg.empty:
         log.warning("no DICOMs or EEG/MEG recordings found under %s", dicom_root)
@@ -1209,6 +1231,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--line-freq", default=None, type=float,
+        help=(
+            "EEG/MEG only — power-line frequency in Hz, stamped into every "
+            "EEG/MEG row's `line_freq` column. Goes into "
+            "PowerLineFrequency in the JSON sidecar (BIDS-required). "
+            "Typical values: 50 (Europe/most of the world), 60 "
+            "(Americas / parts of Asia). Per-row TSV value wins over this."
+        ),
+    )
+    parser.add_argument(
+        "--montage", default=None,
+        help=(
+            "EEG/MEG only — name of an mne built-in montage (e.g. "
+            "standard_1005, biosemi64, easycap-M1) stamped into every "
+            "EEG/MEG row's `montage` column. The converter applies this "
+            "before write_raw_bids → fills electrodes.tsv + "
+            "coordsystem.json. Per-row TSV value wins."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase log verbosity (-v INFO, -vv DEBUG)",
     )
@@ -1224,6 +1266,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         skip_bids_guess=args.no_bids_guess,
         probe_convert=args.probe_convert,
         dataset=args.dataset,
+        line_freq=args.line_freq,
+        montage=args.montage,
     )
     return 0
 

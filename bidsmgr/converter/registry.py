@@ -41,7 +41,10 @@ class ConverterBackend(Protocol):
 
 
 def default_backends(
-    *, dcm2niix_bin: Optional[Path] = None,
+    *,
+    dcm2niix_bin: Optional[Path] = None,
+    line_freq: Optional[float] = 50.0,
+    montage: Optional[str] = None,
 ) -> list[ConverterBackend]:
     """Return the priority-ordered list of registered backends.
 
@@ -54,6 +57,11 @@ def default_backends(
     ``Dcm2niixDirect`` (broad MRI fallback). Each upstream backend's
     ``can_handle`` declines the others' datatypes so the dispatch is
     unambiguous.
+
+    EEG/MEG-specific overrides (``line_freq``, ``montage``) flow into
+    the :class:`MneBidsBackend` constructor so the user can supply them
+    at the CLI level (``bidsmgr-convert --line-freq 60 --montage
+    biosemi64``).
     """
     from .backends.dcm2niix_direct import Dcm2niixDirect
     from .backends.mne_bids import MneBidsBackend
@@ -61,7 +69,7 @@ def default_backends(
 
     return [
         PhysioDcmBackend(),
-        MneBidsBackend(),
+        MneBidsBackend(line_freq=line_freq, montage=montage),
         Dcm2niixDirect(dcm2niix_bin=dcm2niix_bin),
     ]
 

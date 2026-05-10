@@ -97,10 +97,26 @@ def _patch_mne_bids(
     plus channels.tsv etc.
     """
 
+    class _FakeRaw:
+        """Minimal stand-in for an mne ``Raw`` object.
+
+        Carries enough attributes for the backend's
+        ``raw.info["line_freq"]`` injection and ``raw.set_montage(...)``
+        calls to no-op cleanly, so each test can focus on the logic
+        the backend itself adds (line_freq default, montage application,
+        write_raw_bids dispatch).
+        """
+
+        def __init__(self) -> None:
+            self.info: dict = {"line_freq": None}
+
+        def set_montage(self, *args, **kwargs) -> None:
+            self._montage_set = True
+
     def fake_read_raw(path, preload=False, verbose=None):
         if raw_exception is not None:
             raise raw_exception
-        return object()  # opaque "raw" handle
+        return _FakeRaw()
 
     def fake_write_raw_bids(raw, bids_path, *, overwrite=False, format="auto", verbose=None):
         if write_exception is not None:
@@ -329,6 +345,83 @@ class TestConvertFailure:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class TestApplyStandardMontage:
+    """Channel-name normalisation for montage matching.
+
+    PhysioNet pads EDF channel names to 16 chars with trailing dots
+    (``Fc5.``, ``C5..``); other vendors pad with spaces. The backend
+    strips non-alphanumerics in place before applying the montage so
+    real coordinates land in ``electrodes.tsv`` instead of ``n/a``.
+    """
+
+    def test_strips_trailing_dots_then_applies_montage(
+        self, monkeypatch,
+    ) -> None:
+        from bidsmgr.converter.backends.mne_bids import (
+            _apply_standard_montage,
+        )
+
+        class _FakeRaw:
+            def __init__(self, names):
+                self.ch_names = list(names)
+                self.set_montage_called_with = None
+
+            def rename_channels(self, mapping, **kwargs):
+                self.ch_names = [mapping.get(c, c) for c in self.ch_names]
+                self._renames = mapping
+
+            def set_montage(self, montage, **kwargs):
+                self.set_montage_called_with = montage
+
+        # Monkey-patch mne.channels.make_standard_montage to a sentinel.
+        import sys
+        import types
+        fake_mne = types.ModuleType("mne")
+        fake_mne.channels = types.SimpleNamespace(
+            make_standard_montage=lambda name: f"montage:{name}",
+        )
+        monkeypatch.setitem(sys.modules, "mne", fake_mne)
+
+        raw = _FakeRaw(["Fc5.", "Fc3.", "C5..", "Cz", "Iz"])
+        _apply_standard_montage(raw, "standard_1005", source=Path("/x.edf"))
+
+        # Trailing dots stripped.
+        assert raw.ch_names == ["Fc5", "Fc3", "C5", "Cz", "Iz"]
+        # Original names without dots (Cz, Iz) untouched in the rename map.
+        assert "Cz" not in raw._renames
+        # Montage set with the resolved object.
+        assert raw.set_montage_called_with == "montage:standard_1005"
+
+    def test_unknown_montage_logs_and_no_ops(self, monkeypatch) -> None:
+        from bidsmgr.converter.backends.mne_bids import (
+            _apply_standard_montage,
+        )
+
+        class _FakeRaw:
+            ch_names = ["Fp1", "Fp2"]
+
+            def rename_channels(self, *args, **kwargs):
+                self._renamed = True
+
+            def set_montage(self, *args, **kwargs):
+                self._montage_set = True
+
+        import sys
+        import types
+        fake_mne = types.ModuleType("mne")
+
+        def _raise(name):
+            raise ValueError(f"unknown montage {name!r}")
+
+        fake_mne.channels = types.SimpleNamespace(make_standard_montage=_raise)
+        monkeypatch.setitem(sys.modules, "mne", fake_mne)
+
+        raw = _FakeRaw()
+        # Must not raise.
+        _apply_standard_montage(raw, "no_such_montage", source=Path("/x.edf"))
+        assert not getattr(raw, "_montage_set", False)
 
 
 class TestCoerceRun:

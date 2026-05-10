@@ -29,11 +29,17 @@ from bidsmgr.inventory.eeg_meg import (
 
 
 def test_eeg_meg_columns_exact_order() -> None:
-    """The 9 EEG/MEG-specific columns are in the locked order."""
+    """The 12 EEG/MEG-specific columns are in the locked order.
+
+    User-editable: ``task``, ``run``, ``line_freq``, ``montage``.
+    These four condition how the BIDS basename is built and what
+    metadata mne-bids writes.
+    """
     assert EEG_MEG_COLUMNS == (
-        "task", "format", "source_file",
+        "task", "run", "format", "source_file",
         "n_channels", "sfreq", "duration_sec", "n_times",
         "recording_time", "has_positions",
+        "line_freq", "montage",
     )
 
 
@@ -107,46 +113,75 @@ class TestCandidatePaths:
 class TestGuessSubjectSessionTask:
     def test_bids_form_path(self, tmp_path: Path) -> None:
         path = tmp_path / "sub-007" / "ses-pre" / "eeg" / "sub-007_ses-pre_task-rest_eeg.edf"
-        sub, ses, task = guess_subject_session_task(path, tmp_path)
+        sub, ses, task, run = guess_subject_session_task(path, tmp_path)
         assert sub == "007"
         assert ses == "pre"
         assert task == "rest"
+        assert run == ""
+
+    def test_bids_task_with_run(self, tmp_path: Path) -> None:
+        path = tmp_path / "sub-007_ses-pre_task-rest_run-2_eeg.edf"
+        _, _, task, run = guess_subject_session_task(path, tmp_path)
+        assert task == "rest"
+        assert run == "2"
+
+    def test_klingelbach_underscore_form(self, tmp_path: Path) -> None:
+        """``task_driving_run_05_00.fif`` → task=driving, run=05."""
+        path = tmp_path / "sub_us04rt22" / "220215" / "task_driving_run_05_00.fif"
+        sub, _, task, run = guess_subject_session_task(path, tmp_path)
+        assert sub == "us04rt22"
+        assert task == "driving"
+        assert run == "05"
+
+    def test_klingelbach_task_only_no_run(self, tmp_path: Path) -> None:
+        path = tmp_path / "task_rest.fif"
+        _, _, task, run = guess_subject_session_task(path, tmp_path)
+        assert task == "rest"
+        assert run == ""
+
+    def test_klingelbach_task_with_underscore_artifact(
+        self, tmp_path: Path,
+    ) -> None:
+        """``task_emptypost_00.fif`` keeps task=emptypost, drops the _00."""
+        path = tmp_path / "task_emptypost_00.fif"
+        _, _, task, run = guess_subject_session_task(path, tmp_path)
+        assert task == "emptypost"
+        assert run == ""
+
+    def test_physiobank_form_eegmmidb(self, tmp_path: Path) -> None:
+        """``S001/S001R03.edf`` → subject=S001, run=03; task gets the
+        sanitised filename stem as fallback (mne-bids requires a
+        non-empty task; user can rename in the TSV before convert)."""
+        path = tmp_path / "S001" / "S001R03.edf"
+        sub, _, task, run = guess_subject_session_task(path, tmp_path)
+        assert sub == "S001"
+        assert task == "S001R03"
+        assert run == "03"
 
     def test_falls_back_to_topmost_folder_when_no_sub_token(
         self, tmp_path: Path,
     ) -> None:
         path = tmp_path / "S001" / "S001R01.edf"
-        sub, ses, task = guess_subject_session_task(path, tmp_path)
+        sub, ses, task, run = guess_subject_session_task(path, tmp_path)
         assert sub == "S001"
         assert ses == ""
 
-    def test_underscore_prefix_is_stripped_in_fallback(
-        self, tmp_path: Path,
-    ) -> None:
-        """sub_us04rt22 (Klingelbach style) gets its non-BIDS underscore
-        prefix stripped to give us04rt22."""
-        path = tmp_path / "sub_us04rt22" / "220215" / "task_driving_run_05.fif"
-        sub, _, _ = guess_subject_session_task(path, tmp_path)
-        assert sub == "us04rt22"
-
-    def test_filename_stem_is_task_fallback(self, tmp_path: Path) -> None:
-        path = tmp_path / "S001" / "S001R01.edf"
-        _, _, task = guess_subject_session_task(path, tmp_path)
-        # sanitised filename stem; alphanumerics only.
-        assert task == "S001R01"
-
     def test_filename_stem_when_path_is_flat(self, tmp_path: Path) -> None:
+        """Flat layout, no recognizable task/run pattern → fallback uses
+        sanitised stem as task; no run extracted (``_1`` is too
+        ambiguous without an explicit ``run_`` token to count)."""
         path = tmp_path / "Subject20_1.edf"
-        sub, ses, task = guess_subject_session_task(path, tmp_path)
-        # In a flat layout we use the filename stem (sanitised).
+        sub, ses, task, run = guess_subject_session_task(path, tmp_path)
         assert sub == "Subject201"
         assert ses == ""
         assert task == "Subject201"
+        assert run == ""
 
     def test_explicit_task_token_wins(self, tmp_path: Path) -> None:
         path = tmp_path / "Klingelbach driving" / "sub_x" / "task-rest_run-01.fif"
-        _, _, task = guess_subject_session_task(path, tmp_path)
+        _, _, task, run = guess_subject_session_task(path, tmp_path)
         assert task == "rest"
+        assert run == "01"
 
 
 # ---------------------------------------------------------------------------
@@ -273,3 +308,27 @@ class TestScanEegMeg:
             (tmp_path / name).write_bytes(b"x")
         df = scan_eeg_meg(tmp_path, dataset="my_study")
         assert (df["dataset"] == "my_study").all()
+
+    def test_line_freq_and_montage_stamped_into_every_row(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """When the user passes scan-time defaults, every EEG/MEG row
+        carries them — auditable in the TSV, editable per-row before
+        convert."""
+        _patch_probe(monkeypatch)
+        for name in ["a.edf", "b.edf", "c.edf"]:
+            (tmp_path / name).write_bytes(b"x")
+        df = scan_eeg_meg(
+            tmp_path, dataset="study", line_freq=60.0, montage="standard_1005",
+        )
+        assert (df["line_freq"].astype(str) == "60.0").all()
+        assert (df["montage"] == "standard_1005").all()
+
+    def test_line_freq_blank_when_not_supplied(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        _patch_probe(monkeypatch)
+        (tmp_path / "a.edf").write_bytes(b"x")
+        df = scan_eeg_meg(tmp_path, dataset="study")
+        assert df.iloc[0]["line_freq"] == ""
+        assert df.iloc[0]["montage"] == ""

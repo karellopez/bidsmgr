@@ -74,10 +74,16 @@ def run_convert(
     overwrite: bool = False,
     dry_run: bool = False,
     dcm2niix_bin: Optional[Path] = None,
+    line_freq: Optional[float] = 50.0,
+    montage: Optional[str] = None,
 ) -> int:
     """Convert every commit-ready row in ``tsv`` to BIDS under ``bids_parent``.
 
     Returns 0 on success, non-zero if any subject failed.
+
+    ``line_freq`` and ``montage`` are EEG/MEG-only knobs passed to the
+    mne-bids backend; they fill in metadata (``PowerLineFrequency``,
+    ``electrodes.tsv``) that recording files don't always carry.
     """
     tsv = Path(tsv)
     bids_parent = Path(bids_parent)
@@ -88,6 +94,21 @@ def run_convert(
             f"{tsv} has no `dataset` column — re-run `bidsmgr-scan` to "
             "regenerate the inventory with the new column."
         )
+
+    # Defensive in-memory rebuild: the user may have hand-edited the
+    # entities JSON (or display cells) in a spreadsheet without running
+    # `bidsmgr-rebuild`. Reconcile here so the conversion always sees
+    # the freshest BIDS basenames. The TSV file on disk is untouched.
+    if "entities" in df.columns:
+        from ..inventory.rebuild import rebuild_from_entities
+        df, rebuild_report = rebuild_from_entities(df)
+        if rebuild_report.rows_updated:
+            log.info(
+                "in-memory rebuild reconciled %d rows from entities JSON",
+                rebuild_report.rows_updated,
+            )
+        for w in rebuild_report.warnings[:5]:
+            log.warning("rebuild: %s", w)
 
     df = _filter_convertible_rows(df)
     if dataset:
@@ -106,7 +127,11 @@ def run_convert(
         log.warning("no rows to convert (after filtering)")
         return 0
 
-    backends = default_backends(dcm2niix_bin=dcm2niix_bin)
+    backends = default_backends(
+        dcm2niix_bin=dcm2niix_bin,
+        line_freq=line_freq,
+        montage=montage,
+    )
     # Capture dcm2niix version once for provenance — it's still the
     # primary backend for MRI rows.
     primary = select_backend("mri", dcm2niix_bin=dcm2niix_bin)
@@ -461,6 +486,11 @@ def _row_to_task_mri(
     else:
         expected_outputs = (".nii.gz", ".json")
 
+    # Surface the row's canonical entities dict (the source of truth
+    # the user edited) — informational for backends that want to inspect
+    # individual entity values without re-parsing the basename.
+    entities_dict = _parse_entities_json(row)
+
     return ConvertTask(
         row_id=series_uid,
         series_uid=series_uid,
@@ -471,11 +501,26 @@ def _row_to_task_mri(
         session=session,
         datatype=datatype,
         suffix=suffix,
-        entities={},  # informational; backend doesn't read it
+        entities=entities_dict,
         basename=basename,
         expected_outputs=expected_outputs,
         repetition_type=str(row.get("repetition_type", "")).strip(),
     )
+
+
+def _parse_entities_json(row: pd.Series) -> dict[str, str]:
+    """Parse the row's ``entities`` JSON column. Returns ``{}`` on error."""
+    raw = str(row.get("entities", "")).strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    # Normalise values to str (Pydantic ConvertTask wants dict[str, str]).
+    return {str(k): str(v) for k, v in data.items()}
 
 
 def _row_to_task_eeg_meg(
@@ -537,26 +582,36 @@ def _row_to_task_eeg_meg(
                 src_path = c
                 break
 
-    # Entities for BIDSPath construction in the backend.
-    entities: dict[str, str] = {}
-    task_value = str(row.get("task", "")).strip()
-    if task_value:
-        entities["task"] = task_value
-    # Run is sometimes encoded in the basename (run-N) or, for legacy
-    # rows, in a separate "run" column. Pull from either.
-    run_value = str(row.get("run", "")).strip()
-    if not run_value:
-        # Try to extract from basename: ``..._run-N_...``.
-        m = re.search(r"_run-(\d+)", basename)
-        if m:
-            run_value = m.group(1)
-    if run_value:
-        entities["run"] = run_value
+    # The row's ``entities`` column is the source of truth (the in-memory
+    # rebuild ran above so it's already reconciled with display cells).
+    # Fall back to individual columns / basename parsing for legacy
+    # inventories that don't have the ``entities`` column.
+    entities = _parse_entities_json(row)
+    if not entities.get("task"):
+        task_value = str(row.get("task", "")).strip()
+        if task_value:
+            entities["task"] = task_value
+    if not entities.get("run"):
+        run_value = str(row.get("run", "")).strip()
+        if not run_value:
+            m = re.search(r"_run-(\d+)", basename)
+            if m:
+                run_value = m.group(1)
+        if run_value:
+            entities["run"] = run_value
 
     # mne-bids writes the format-native data file (.edf / .vhdr / .fif /
     # …) plus channels.tsv + datatype JSON. We don't validate the exact
     # extension — the backend collects whatever lands in the datatype dir.
     expected_outputs: tuple[str, ...] = (".json",)
+
+    # Per-row EEG/MEG knobs (if the user filled them in the TSV).
+    line_freq_raw = str(row.get("line_freq", "")).strip()
+    try:
+        line_freq = float(line_freq_raw) if line_freq_raw else None
+    except ValueError:
+        line_freq = None
+    montage = str(row.get("montage", "")).strip() or None
 
     return ConvertTask(
         row_id=source_file,  # source path is unique per recording
@@ -572,6 +627,8 @@ def _row_to_task_eeg_meg(
         basename=basename,
         expected_outputs=expected_outputs,
         repetition_type=str(row.get("repetition_type", "")).strip(),
+        line_freq=line_freq,
+        montage=montage,
     )
 
 
@@ -816,6 +873,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Path to a specific dcm2niix binary (defaults to bundled).",
     )
     parser.add_argument(
+        "--line-freq", default=50.0, type=float,
+        help=(
+            "Power-line frequency in Hz, written to PowerLineFrequency in "
+            "EEG/MEG/iEEG JSON sidecars (BIDS-required). Default 50; use 60 "
+            "in the Americas / parts of Asia. Pass --line-freq 0 to leave "
+            "unset and let the recording's own value apply."
+        ),
+    )
+    parser.add_argument(
+        "--montage", default=None,
+        help=(
+            "Apply a built-in mne montage to every EEG/MEG row before "
+            "writing (e.g. standard_1020, biosemi64, easycap-M1). Fills "
+            "electrodes.tsv + coordsystem.json. Use only if all rows in "
+            "the inventory share the same channel layout. See "
+            "`mne.channels.get_builtin_montages()` for the full list."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase log verbosity (-v INFO, -vv DEBUG)",
     )
@@ -832,6 +908,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         overwrite=args.overwrite,
         dry_run=args.dry_run,
         dcm2niix_bin=args.dcm2niix,
+        line_freq=args.line_freq if args.line_freq > 0 else None,
+        montage=args.montage,
     )
 
 

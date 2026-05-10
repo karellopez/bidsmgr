@@ -16,6 +16,7 @@ to fit bidsmgr's per-task ``ConverterBackend`` Protocol.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 import warnings
@@ -23,6 +24,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..types import ConvertResult, ConvertTask
+
+
+@contextlib.contextmanager
+def _noop():
+    yield
 
 log = logging.getLogger(__name__)
 
@@ -34,12 +40,38 @@ _SUPPORTED_DATATYPES: frozenset[str] = frozenset({"eeg", "meg", "ieeg", "nirs"})
 class MneBidsBackend:
     """Convert raw EEG/MEG/iEEG/NIRS recordings via mne-bids.
 
-    Stateless; safe to instantiate once and reuse across tasks. mne and
-    mne-bids are imported lazily inside :meth:`convert` so importing the
-    backend module is cheap even when those deps are missing.
+    Per-row knobs come from the :class:`ConvertTask` (set by the CLI
+    from the inventory TSV's ``line_freq`` / ``montage`` columns). The
+    constructor takes only fallback defaults used when those columns
+    are blank — typical case is the user supplies a single dataset-
+    wide default at scan time and the per-row column carries it
+    forward.
+
+    What the backend writes (via mne-bids):
+
+    * The recording in its native format where mne-bids supports BIDS
+      I/O (EDF/BDF/BrainVision/EEGLAB/FIF/CTF/KIT), or a re-encoded
+      sibling otherwise.
+    * ``*_channels.tsv`` (always — one row per recording channel).
+    * The datatype JSON sidecar with ``PowerLineFrequency``
+      (BIDS-required for EEG/MEG/iEEG, populated from the row's
+      ``line_freq``).
+    * ``*_events.tsv`` from ``raw.annotations`` (auto for EDF+).
+    * ``*_electrodes.tsv`` + ``*_coordsystem.json`` when a montage is
+      applied (per-row ``montage`` column, fallback to constructor).
     """
 
     name = "mne_bids"
+
+    def __init__(
+        self,
+        *,
+        line_freq: Optional[float] = 50.0,
+        montage: Optional[str] = None,
+    ) -> None:
+        # Fallback defaults used when the per-task value is None/blank.
+        self.default_line_freq = line_freq
+        self.default_montage = montage
 
     def can_handle(self, task: ConvertTask) -> bool:
         if task.datatype not in _SUPPORTED_DATATYPES:
@@ -102,6 +134,21 @@ class MneBidsBackend:
                     error=f"mne.io.read_raw failed: {type(exc).__name__}: {exc}",
                     duration_s=time.monotonic() - t0,
                 )
+
+            # Per-row line_freq (TSV) wins; constructor default is the
+            # dataset-wide fallback.
+            line_freq = task.line_freq
+            if line_freq is None:
+                line_freq = self.default_line_freq
+            if line_freq is not None and not raw.info.get("line_freq"):
+                with raw.info._unlock() if hasattr(raw.info, "_unlock") else _noop():
+                    raw.info["line_freq"] = float(line_freq)
+
+            # Per-row montage (TSV) wins; constructor default is the
+            # fallback.
+            montage_name = task.montage or self.default_montage
+            if montage_name:
+                _apply_standard_montage(raw, montage_name, source)
 
             # mne-bids writes ``sub-XXX/[ses-Y/]<datatype>/...`` *inside*
             # its ``root``. The orchestrator hands us a per-subject (or
@@ -179,6 +226,57 @@ class MneBidsBackend:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _apply_standard_montage(raw, montage_name: str, source: Path) -> None:
+    """Apply a built-in mne montage to ``raw``, in place.
+
+    Workaround for EDF padding artefacts: PhysioNet pads channel
+    names to 16 ASCII chars with trailing dots (``Fc5.``, ``C5..``).
+    Some Siemens/Brain Products vendors pad with spaces. Strip both
+    before matching against the montage's canonical names so
+    ``electrodes.tsv`` ends up with real coordinates instead of
+    ``n/a``. Originals are preserved in ``raw.annotations`` /
+    ``channels.tsv``; only the in-memory ``ch_names`` is normalised.
+    """
+    import re
+
+    import mne  # local import — caller already triggered the heavy import
+
+    try:
+        montage = mne.channels.make_standard_montage(montage_name)
+    except (ValueError, KeyError) as exc:
+        log.warning(
+            "unknown montage name %r for %s: %s",
+            montage_name, source.name, exc,
+        )
+        return
+
+    # Build a normalisation map: original ch_name → cleaned ch_name.
+    # ``re.sub('[^A-Za-z0-9]', '', name)`` drops dots and whitespace
+    # while preserving alphanumerics; mne's set_montage with
+    # ``match_case=False`` then matches ``Fc5`` → montage's ``FC5``.
+    rename: dict[str, str] = {}
+    for ch in list(raw.ch_names):
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", ch)
+        if cleaned and cleaned != ch:
+            rename[ch] = cleaned
+    if rename:
+        raw.rename_channels(rename, allow_duplicates=False, verbose="ERROR")
+
+    try:
+        raw.set_montage(
+            montage,
+            match_case=False,
+            match_alias=False,
+            on_missing="ignore",
+            verbose="ERROR",
+        )
+    except Exception as exc:
+        log.warning(
+            "could not apply montage %r to %s: %s",
+            montage_name, source.name, exc,
+        )
 
 
 def _find_bids_root(staging_dir: Path) -> Path:

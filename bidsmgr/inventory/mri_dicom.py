@@ -79,6 +79,16 @@ EXTENDED_COLUMNS: tuple[str, ...] = (
 DATASET_COLUMNS: tuple[str, ...] = ("dataset",)
 
 
+# The canonical BIDS entity dict per row, JSON-encoded. **Source of
+# truth** for the BIDS basename: scanners populate it; ``bidsmgr-rebuild``
+# regenerates ``proposed_basename`` and mirror cells from it (or, in
+# ``--from columns`` mode, the reverse). The converter reads from this
+# column directly, so the row's BIDS name always reflects whatever the
+# user last edited here. Format: a JSON object with BIDS entity keys —
+# ``{"sub": "001", "ses": "pre", "task": "rest", "run": "1", ...}``.
+BIDS_ENTITIES_COLUMNS: tuple[str, ...] = ("entities",)
+
+
 def is_dicom_file(path: str) -> bool:
     """Return True if ``path`` looks like a DICOM file.
 

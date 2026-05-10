@@ -39,18 +39,27 @@ from bidsmgr.inventory.mri_dicom import (
 
 
 class TestUnifiedColumnContract:
-    def test_full_47_column_layout(self) -> None:
-        """Locked schema: TSV(22) + BIDS_GUESS(8) + DATASET(1) +
-        PROBE(4) + EXTENDED(3) + EEG_MEG(9) = 47."""
+    def test_full_unified_column_layout(self) -> None:
+        """Locked schema: TSV(22) + BIDS_GUESS(8) + ENTITIES(1) +
+        DATASET(1) + PROBE(4) + EXTENDED(3) + EEG_MEG(12) = 51.
+
+        The new ``entities`` JSON column is the canonical source of
+        truth for the BIDS basename; ``proposed_basename`` and the
+        ``task``/``run``/``session`` mirror cells are derived from it
+        by ``bidsmgr-rebuild``.
+        """
         df = _empty_unified_dataframe()
         cols = _unified_column_order(df)
-        assert len(cols) == 22 + 8 + 1 + 4 + 3 + 9
+        assert len(cols) == 22 + 8 + 1 + 1 + 4 + 3 + 12
+        # ``dataset`` comes after BidsGuess + the new ``entities`` column.
+        ds_idx = cols.index("dataset")
+        assert ds_idx == len(TSV_COLUMNS) + len(BIDS_GUESS_COLUMNS) + 1
+        # ``entities`` lives between BidsGuess and dataset.
+        entities_idx = cols.index("entities")
+        assert entities_idx == len(TSV_COLUMNS) + len(BIDS_GUESS_COLUMNS)
         # Order: MRI groups first, EEG/MEG last.
         assert cols[: len(TSV_COLUMNS)] == list(TSV_COLUMNS)
         assert cols[-len(EEG_MEG_COLUMNS):] == list(EEG_MEG_COLUMNS)
-        # Dataset comes after the BidsGuess group.
-        ds_idx = cols.index("dataset")
-        assert ds_idx == len(TSV_COLUMNS) + len(BIDS_GUESS_COLUMNS)
 
     def test_finalize_fills_missing_with_empty_string(self) -> None:
         """``concat`` introduces NaN; finalize replaces with ``""``."""
