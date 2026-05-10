@@ -13,6 +13,7 @@ Reference: ``../inspector_proto/proto.py`` (visual prototype) and
 ``../inspector_proto/data.py`` (data shapes the GUI renders).
 """
 
+from .html_report import render_html
 from .types import (
     FieldLevel,
     FileVerdict,
@@ -27,5 +28,5 @@ from .validator import validate
 __all__ = [
     "FieldLevel", "FileVerdict", "Issue", "Severity",
     "SidecarField", "ValidationReport",
-    "rollup_severity", "validate",
+    "render_html", "rollup_severity", "validate",
 ]

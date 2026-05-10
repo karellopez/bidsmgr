@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
-from ..editor import Severity, ValidationReport, validate
+from ..editor import Severity, ValidationReport, render_html, validate
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ def run_validate_cli(
     strict: bool = False,
     strict_warn: bool = False,
     write_report: bool = True,
+    html_report: bool = False,
 ) -> int:
     """Validate every BIDS root under ``target``.
 
@@ -71,6 +72,8 @@ def run_validate_cli(
 
         if write_report:
             _write_validation_report(bids_root, report)
+        if html_report:
+            _write_html_report(bids_root, report)
 
         _print_summary(bids_root, report)
 
@@ -134,6 +137,20 @@ def _write_validation_report(bids_root: Path, report: ValidationReport) -> None:
     out = out_dir / "validation_report.json"
     payload = report.model_dump(mode="json")
     out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_html_report(bids_root: Path, report: ValidationReport) -> None:
+    """Persist a self-contained HTML validation report.
+
+    Lives next to the JSON report at
+    ``<bids_root>/.bidsmgr/validation_report.html``. Inline-CSS only;
+    safe to copy or zip and share.
+    """
+    out_dir = bids_root / ".bidsmgr"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "validation_report.html"
+    out.write_text(render_html(report), encoding="utf-8")
+    log.info("html report written to %s", out)
 
 
 def _print_summary(bids_root: Path, report: ValidationReport) -> None:
@@ -220,6 +237,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.set_defaults(write_report=True)
     parser.add_argument(
+        "--html",
+        dest="html_report", action="store_true",
+        help=(
+            "In addition to the JSON report, write a self-contained "
+            "HTML report at <bids_root>/.bidsmgr/validation_report.html. "
+            "Inline CSS, no external assets — safe to share or archive. "
+            "Issues are colour-coded green/amber/red and grouped by "
+            "scope (dataset / folder / file)."
+        ),
+    )
+    parser.set_defaults(html_report=False)
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase log verbosity (-v INFO, -vv DEBUG)",
     )
@@ -234,6 +263,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         strict=args.strict,
         strict_warn=args.strict_warn,
         write_report=args.write_report,
+        html_report=args.html_report,
     )
 
 
