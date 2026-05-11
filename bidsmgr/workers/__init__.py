@@ -2,12 +2,28 @@
 
 Reference: architecture.md §12.
 
-Rule: workers import core modules, never widgets. They receive
-``QObject`` signals from the GUI and emit signals back. The GUI
-thread never blocks on core operations.
+Rule: workers import core modules (``cli/``, ``inventory/``, etc.) but
+never import widgets. The GUI subscribes to worker signals and updates
+its model on the main thread. The GUI thread therefore never blocks on
+core operations.
 
-Modules: ``scan_worker``, ``classify_worker``, ``convert_worker``,
-``validate_worker``.
+Public surface:
 
-Stub — not yet implemented.
+* :class:`ScanWorker` — runs :func:`bidsmgr.cli.scan.run_scan` on a
+  background thread.
+
+Future workers (one per CLI verb): ``ConvertWorker``,
+``MetadataWorker``, ``ValidateWorker``.
 """
+
+from .convert import ConvertWorker
+from .metadata import MetadataWorker
+from .scan import ScanWorker
+from .validate import ValidateWorker
+
+__all__ = [
+    "ConvertWorker",
+    "MetadataWorker",
+    "ScanWorker",
+    "ValidateWorker",
+]

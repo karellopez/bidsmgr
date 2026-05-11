@@ -563,6 +563,16 @@ def scan_eeg_meg(
             "line_freq": "" if line_freq is None else line_freq,
             "montage": montage or "",
             "dataset": dataset or "",
+            # Surface the classifier-style columns so the inspector's
+            # ``suffix`` and ``data`` columns show useful values for
+            # EEG/MEG rows. MRI rows get these from the BidsGuess
+            # classifier; EEG/MEG rows are scanner-deterministic so
+            # we set them directly here.
+            "bids_guess_classifier": "eeg_meg_scanner",
+            "bids_guess_datatype": datatype,
+            "bids_guess_suffix": datatype,  # eeg / meg / ieeg / nirs
+            "bids_guess_confidence": "1.00",
+            "bids_guess_skip": False,
         })
 
     if not rows:

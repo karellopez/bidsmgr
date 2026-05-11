@@ -245,6 +245,21 @@ class TestScanEegMeg:
         assert (df["modality"] == "eeg").all()
         assert (df["proposed_datatype"] == "eeg").all()
 
+    def test_eeg_meg_rows_carry_bids_guess_suffix(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The inspector's ``suffix`` column reads ``bids_guess_suffix``.
+
+        EEG/MEG rows must populate that column so the inspector shows
+        ``eeg`` / ``meg`` instead of a blank cell.
+        """
+        _patch_probe(monkeypatch)
+        (tmp_path / "S00.edf").write_bytes(b"x")
+        df = scan_eeg_meg(tmp_path)
+        assert (df["bids_guess_suffix"] == "eeg").all()
+        assert (df["bids_guess_datatype"] == "eeg").all()
+        assert (df["bids_guess_classifier"] == "eeg_meg_scanner").all()
+
     def test_scans_hierarchical_subject_layout(
         self, tmp_path: Path, monkeypatch,
     ) -> None:

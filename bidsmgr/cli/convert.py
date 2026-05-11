@@ -76,6 +76,7 @@ def run_convert(
     dcm2niix_bin: Optional[Path] = None,
     line_freq: Optional[float] = 50.0,
     montage: Optional[str] = None,
+    raw_root: Optional[Path] = None,
 ) -> int:
     """Convert every commit-ready row in ``tsv`` to BIDS under ``bids_parent``.
 
@@ -87,6 +88,19 @@ def run_convert(
     """
     tsv = Path(tsv)
     bids_parent = Path(bids_parent)
+
+    # Candidates the EEG/MEG row resolver uses when ``source_file`` is
+    # stored relative-to-raw-root in the inventory TSV. We try (in order):
+    # explicit ``raw_root`` arg, then the TSV's parent (the GUI's default
+    # is to write the TSV at ``<raw_root>/.bidsmgr_scan.tsv``), then the
+    # current working directory. The MRI path is unaffected — DICOM files
+    # come from the ``files_by_uid`` sidecar in absolute form.
+    source_search_roots: tuple[Path, ...] = tuple(
+        p for p in [
+            Path(raw_root) if raw_root is not None else None,
+            tsv.parent,
+        ] if p is not None
+    )
 
     df = pd.read_csv(tsv, sep="\t", dtype=str, keep_default_na=False)
     if "dataset" not in df.columns:
@@ -155,6 +169,7 @@ def run_convert(
 
             tasks = _build_tasks_for_subject(
                 subject_df, bids_root, files_by_uid,
+                source_search_roots=source_search_roots,
             )
             if not tasks:
                 continue
@@ -391,10 +406,15 @@ def _build_tasks_for_subject(
     subject_df: pd.DataFrame,
     bids_root: Path,
     files_by_uid: dict[str, list[str]],
+    *,
+    source_search_roots: tuple[Path, ...] = (),
 ) -> list[ConvertTask]:
     tasks: list[ConvertTask] = []
     for _, row in subject_df.iterrows():
-        task = _row_to_task(row, bids_root, files_by_uid)
+        task = _row_to_task(
+            row, bids_root, files_by_uid,
+            source_search_roots=source_search_roots,
+        )
         if task is not None:
             tasks.append(task)
     return tasks
@@ -404,6 +424,8 @@ def _row_to_task(
     row: pd.Series,
     bids_root: Path,
     files_by_uid: dict[str, list[str]],
+    *,
+    source_search_roots: tuple[Path, ...] = (),
 ) -> Optional[ConvertTask]:
     """Detect MRI vs EEG/MEG row shape and dispatch to the right builder.
 
@@ -417,7 +439,9 @@ def _row_to_task(
 
     source_file = str(row.get("source_file", "")).strip()
     if source_file:
-        return _row_to_task_eeg_meg(row, bids_root)
+        return _row_to_task_eeg_meg(
+            row, bids_root, source_search_roots=source_search_roots,
+        )
 
     return None
 
@@ -526,6 +550,8 @@ def _parse_entities_json(row: pd.Series) -> dict[str, str]:
 def _row_to_task_eeg_meg(
     row: pd.Series,
     bids_root: Path,
+    *,
+    source_search_roots: tuple[Path, ...] = (),
 ) -> Optional[ConvertTask]:
     """Build a :class:`ConvertTask` for an EEG/MEG/iEEG/NIRS row.
 
@@ -566,17 +592,19 @@ def _row_to_task_eeg_meg(
     if not basename:
         return None
 
-    # Resolve source_file to an absolute path. The scan TSV stores it
+    # Resolve source_file to an absolute path. The scan stores it
     # relative to the scan input root; the convert input is the BIDS
-    # parent — different reference. Best effort: try as absolute first,
-    # then as path-relative-to-cwd.
+    # parent — different reference. Try in order: each ``source_search_root``
+    # the caller provided (the GUI passes the raw_root explicitly; the
+    # CLI auto-fills the TSV's parent), then the current working
+    # directory, then ``.resolve()`` as a last resort.
     src_path = Path(source_file)
     if not src_path.is_absolute():
-        # Try common locations: cwd, then the TSV's parent dir.
-        candidates = [
-            Path.cwd() / src_path,
-            src_path.resolve(),
-        ]
+        candidates: list[Path] = []
+        for root in source_search_roots:
+            candidates.append(Path(root) / src_path)
+        candidates.append(Path.cwd() / src_path)
+        candidates.append(src_path.resolve())
         for c in candidates:
             if c.exists():
                 src_path = c
@@ -892,6 +920,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--raw-root", default=None, type=Path,
+        help=(
+            "Folder the scan was run against. Used as the first "
+            "candidate when resolving EEG/MEG rows' relative "
+            "``source_file`` paths. If omitted, the TSV's parent "
+            "directory is tried (the GUI's default puts the TSV "
+            "inside the raw root)."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase log verbosity (-v INFO, -vv DEBUG)",
     )
@@ -910,6 +948,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         dcm2niix_bin=args.dcm2niix,
         line_freq=args.line_freq if args.line_freq > 0 else None,
         montage=args.montage,
+        raw_root=args.raw_root,
     )
 
 

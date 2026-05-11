@@ -28,3 +28,8 @@ Submodules:
 prototype's source lives at ``../../inspector_proto/theme.qss``
 for visual comparison.
 """
+
+from .converter_panel import ConverterPanel
+from .theme_manager import DARK, LIGHT, PALETTES, ThemeManager
+
+__all__ = ["ConverterPanel", "DARK", "LIGHT", "PALETTES", "ThemeManager"]

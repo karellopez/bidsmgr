@@ -278,6 +278,44 @@ class TestConvertSuccess:
         for p in result.staged_files:
             assert p.parent == staging / "meg"
 
+    def test_meg_datatype_skips_standard_montage(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Standard 10-20 montages are an EEG / iEEG / NIRS concept;
+        applying one to MEG-Neuromag data routinely collides on channel
+        rename. The backend must skip ``_apply_standard_montage``
+        entirely for MEG, even when the task or backend default carries
+        a montage name.
+        """
+        calls: list = []
+        # Backend-level default carries the EEG montage; the task itself
+        # doesn't set one. The MEG-datatype guard in the backend must
+        # short-circuit before _apply_standard_montage is reached.
+        b = MneBidsBackend(montage="standard_1005")
+        task = _make_task(
+            tmp_path,
+            datatype="meg",
+            suffix="meg",
+            basename="sub-001_task-rest_meg",
+        )
+        _patch_mne_bids(monkeypatch, write_extensions=(".fif", ".json"))
+
+        # Spy on _apply_standard_montage — it must NOT be called for MEG.
+        from bidsmgr.converter.backends import mne_bids as backend_mod
+        original = backend_mod._apply_standard_montage
+        def _spy(*a, **kw):
+            calls.append((a, kw))
+            return original(*a, **kw)
+        monkeypatch.setattr(backend_mod, "_apply_standard_montage", _spy)
+
+        staging = tmp_path / ".tmp_bidsmgr" / "sub-001"
+        staging.mkdir(parents=True)
+        result = b.convert(task, staging)
+        assert result.success is True
+        assert calls == [], (
+            "MEG datatype should not invoke standard-montage logic"
+        )
+
 
 # ---------------------------------------------------------------------------
 # convert — failure paths
@@ -393,6 +431,46 @@ class TestApplyStandardMontage:
         assert "Cz" not in raw._renames
         # Montage set with the resolved object.
         assert raw.set_montage_called_with == "montage:standard_1005"
+
+    def test_collision_skips_offending_rename(self, monkeypatch) -> None:
+        """If stripping non-alphanumerics would collide with an existing
+        channel name, the rename for that one channel is skipped — the
+        rest still go through, and mne is never asked to do a
+        duplicate-introducing rename.
+        """
+        from bidsmgr.converter.backends.mne_bids import (
+            _apply_standard_montage,
+        )
+
+        class _FakeRaw:
+            def __init__(self, names):
+                self.ch_names = list(names)
+
+            def rename_channels(self, mapping, **kwargs):
+                self._renames = mapping
+                self.ch_names = [mapping.get(c, c) for c in self.ch_names]
+
+            def set_montage(self, montage, **kwargs):
+                self._montage = montage
+
+        import sys
+        import types
+        fake_mne = types.ModuleType("mne")
+        fake_mne.channels = types.SimpleNamespace(
+            make_standard_montage=lambda name: f"montage:{name}",
+        )
+        monkeypatch.setitem(sys.modules, "mne", fake_mne)
+
+        # ``MEG 0113`` stripped → ``MEG0113`` collides with the existing
+        # ``MEG0113`` (no space). The renamer must skip the offending
+        # entry instead of crashing.
+        raw = _FakeRaw(["MEG 0113", "MEG0113", "MEG 0112"])
+        _apply_standard_montage(raw, "standard_1005", source=Path("/x.fif"))
+
+        # ``MEG 0113`` keeps its original name; ``MEG 0112`` gets stripped.
+        assert "MEG 0113" in raw.ch_names
+        assert "MEG0113" in raw.ch_names
+        assert "MEG0112" in raw.ch_names
 
     def test_unknown_montage_logs_and_no_ops(self, monkeypatch) -> None:
         from bidsmgr.converter.backends.mne_bids import (

@@ -121,6 +121,41 @@ QPushButton#tb-btn-primary {
 }
 QPushButton#tb-btn-primary:hover { background: $accent; }
 
+/* Toggle-style toolbar button (e.g. "Highlight repeats"). Switches
+ * to the purple palette when checked so the user knows the overlay
+ * is active. */
+QPushButton#tb-btn-toggle {
+    background: transparent;
+    border: 1px solid $border;
+    color: $dim;
+    padding: 4px 10px;
+    border-radius: 4px;
+}
+QPushButton#tb-btn-toggle:hover { color: $text; background: $surface3; }
+QPushButton#tb-btn-toggle:checked {
+    background: $purple_bg;
+    border-color: $purple_border;
+    color: $purple;
+}
+
+/* Tiny "TSV:" / "dataset:" label sitting before an input in the toolbar. */
+QLabel#tb-mini-label {
+    color: $dim;
+    font-size: 11px;
+}
+
+/* Toolbar input fields (TSV filename, etc.). Compact, palette-driven. */
+QLineEdit#tb-input {
+    background: $surface3;
+    color: $text;
+    border: 1px solid $border;
+    border-radius: 4px;
+    padding: 2px 6px;
+    selection-background-color: $accent;
+    selection-color: $primary_btn_text;
+}
+QLineEdit#tb-input:focus { border-color: $accent; }
+
 QFrame#vsep {
     background: $border;
     max-width: 1px;
@@ -199,6 +234,72 @@ QLabel#pane-h5 {
     font-size: 10px;
     font-weight: 600;
     letter-spacing: 1px;
+}
+
+/* Placeholder / hint labels used in empty panes and stub tabs. They
+ * follow the dim palette token so dark↔light toggle refreshes them. */
+QLabel#pane-hint {
+    color: $dim;
+    padding: 24px;
+}
+
+/* Bottom-dock log view. Uses a slightly tinted background so the
+ * worker output reads clearly against both palettes. Selection inherits
+ * the accent token (already covered by ``QPalette.Highlight``). */
+QPlainTextEdit#dock-log {
+    background: $surface;
+    color: $text;
+    border: none;
+    font-family: "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
+    font-size: 11px;
+    selection-background-color: $accent;
+    selection-color: $primary_btn_text;
+}
+
+/* ------------------------------------------------------------------
+ * Issues dialog (clicked from the toolbar chips)
+ * ------------------------------------------------------------------ */
+QDialog { background: $bg; }
+
+QFrame#issue-dialog-header {
+    background: $surface;
+    border-bottom: 1px solid $border;
+}
+QLabel#issue-dialog-title {
+    color: $text;
+    font-size: 14px;
+    font-weight: 600;
+}
+QLabel#issue-dialog-subtitle {
+    color: $dim;
+    font-size: 11px;
+}
+QScrollArea#issue-dialog-scroll, QWidget#issue-dialog-body { background: $bg; }
+QFrame#issue-dialog-footer {
+    background: $surface;
+    border-top: 1px solid $border;
+}
+
+/* One row's card: row identifier + stacked ValMessages. */
+QFrame#issue-card {
+    background: $surface;
+    border: 1px solid $border;
+    border-radius: 8px;
+}
+QPushButton#issue-card-title {
+    color: $accent;
+    background: transparent;
+    border: none;
+    text-align: left;
+    padding: 0;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
+}
+QPushButton#issue-card-title:hover { text-decoration: underline; }
+QLabel#issue-card-jump-hint {
+    color: $dim;
+    font-size: 10px;
 }
 
 QWidget#pane {
@@ -551,3 +652,17 @@ QScrollBar::handle:horizontal {
 QScrollBar::handle:horizontal:hover { background: $muted; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+
+/* ------------------------------------------------------------------
+ * Busy spinner (toolbar)
+ * ------------------------------------------------------------------ */
+QWidget#busy-spinner { background: transparent; }
+QLabel#busy-spinner-glyph {
+    color: $accent;
+    font-size: 14px;
+    font-weight: 700;
+}
+QLabel#busy-spinner-message {
+    color: $dim;
+    font-size: 11px;
+}

@@ -145,9 +145,15 @@ class MneBidsBackend:
                     raw.info["line_freq"] = float(line_freq)
 
             # Per-row montage (TSV) wins; constructor default is the
-            # fallback.
+            # fallback. Standard 10-20-style montages are an EEG / iEEG /
+            # NIRS concept — MEG sensors have intrinsic positions in
+            # scanner space, and applying an EEG montage's channel rename
+            # to MEG-Neuromag data routinely collides (e.g. ``MEG 0113``
+            # + ``EEG 001`` channel sets after non-alphanumeric stripping).
+            # Skip silently for MEG so the user's dataset-wide setting
+            # doesn't crash MEG rows.
             montage_name = task.montage or self.default_montage
-            if montage_name:
+            if montage_name and task.datatype != "meg":
                 _apply_standard_montage(raw, montage_name, source)
 
             # mne-bids writes ``sub-XXX/[ses-Y/]<datatype>/...`` *inside*
@@ -256,13 +262,42 @@ def _apply_standard_montage(raw, montage_name: str, source: Path) -> None:
     # ``re.sub('[^A-Za-z0-9]', '', name)`` drops dots and whitespace
     # while preserving alphanumerics; mne's set_montage with
     # ``match_case=False`` then matches ``Fc5`` → montage's ``FC5``.
+    #
+    # Pre-seed the seen-names set with channels that are ALREADY in
+    # alphanumeric form (``MEG0113`` without space). If a different
+    # channel like ``MEG 0113`` would strip to the same name, skip the
+    # rename so we don't introduce a duplicate.
+    original_names = list(raw.ch_names)
+    seen_cleaned: set[str] = {
+        ch for ch in original_names
+        if re.sub(r"[^A-Za-z0-9]", "", ch) == ch  # already clean
+    }
+
     rename: dict[str, str] = {}
-    for ch in list(raw.ch_names):
+    for ch in original_names:
         cleaned = re.sub(r"[^A-Za-z0-9]", "", ch)
-        if cleaned and cleaned != ch:
-            rename[ch] = cleaned
+        if not cleaned or cleaned == ch:
+            continue  # already in seen_cleaned via the pre-seed above
+        if cleaned in seen_cleaned:
+            log.warning(
+                "skipping channel rename %r → %r for %s "
+                "(would collide with an existing channel)",
+                ch, cleaned, source.name,
+            )
+            continue
+        rename[ch] = cleaned
+        seen_cleaned.add(cleaned)
     if rename:
-        raw.rename_channels(rename, allow_duplicates=False, verbose="ERROR")
+        try:
+            raw.rename_channels(rename, allow_duplicates=False, verbose="ERROR")
+        except ValueError as exc:
+            # Last-resort guard: if mne still rejects (unlikely after
+            # the pre-flight collision check above), warn and continue
+            # without the rename rather than crashing the row.
+            log.warning(
+                "channel rename failed for %s: %s — proceeding without rename",
+                source.name, exc,
+            )
 
     try:
         raw.set_montage(
