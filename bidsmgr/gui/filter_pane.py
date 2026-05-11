@@ -126,79 +126,107 @@ class FilterPane(QWidget):
     # ------------------------------------------------------------------
 
     def _build_tree(self) -> None:
-        """Walk the model's DataFrame and group rows by ds/sub/ses/datatype.
+        """Walk the model's DataFrame and build the structural tree.
 
-        Each leaf (datatype) carries the row indices it represents; the
-        leaf's check state is set from the union of include flags of
-        those rows. Parents auto-derive their tri-state via Qt's
-        ``ItemIsAutoTristate``.
+        Layout: ``dataset → subject → session → datatype → sequence``,
+        each individual sequence appearing as its own leaf carrying a
+        single row index. Parents (dataset/subject/session/datatype) are
+        tri-state via ``ItemIsAutoTristate``; toggling a parent cascades
+        through every sequence underneath it. Toggling a single sequence
+        leaf writes ``include`` for that one row only.
         """
         assert self._model is not None
         df = self._model.dataframe()
 
-        # Build (dataset, subject, session, datatype) → [row_indices]
-        groups: dict = {}
+        # (ds, sub, ses, dt) → list of (row_idx, leaf_label) tuples,
+        # preserving the order rows appear in the DataFrame.
+        groups: dict[tuple[str, str, str, str], list[tuple[int, str]]] = {}
         for i in df.index:
             ds = str(df.at[i, "dataset"]) if "dataset" in df.columns else ""
             sub = str(df.at[i, "BIDS_name"]) if "BIDS_name" in df.columns else ""
             ses = str(df.at[i, "session"]) if "session" in df.columns else ""
             dt = str(df.at[i, "proposed_datatype"]) if "proposed_datatype" in df.columns else ""
-            key = (ds or "(no dataset)", sub or "(no subject)", ses, dt or "(no datatype)")
-            groups.setdefault(key, []).append(int(i))
+            key = (
+                ds or "(no dataset)",
+                sub or "(no subject)",
+                ses,
+                dt or "(no datatype)",
+            )
+            label = self._sequence_label(df, int(i))
+            groups.setdefault(key, []).append((int(i), label))
 
-        # Build the tree.
         ds_nodes: dict[str, QTreeWidgetItem] = {}
         sub_nodes: dict[tuple[str, str], QTreeWidgetItem] = {}
         ses_nodes: dict[tuple[str, str, str], QTreeWidgetItem] = {}
+        dt_nodes: dict[tuple[str, str, str, str], QTreeWidgetItem] = {}
 
-        pal = CUR()
         for (ds, sub, ses, dt) in sorted(groups.keys()):
-            row_ids = groups[(ds, sub, ses, dt)]
+            entries = groups[(ds, sub, ses, dt)]
+            # --- dataset / subject / session / datatype parents ---
             if ds not in ds_nodes:
-                node = QTreeWidgetItem([self._format_label(ds, "")])
-                node.setFlags(
-                    node.flags()
-                    | Qt.ItemFlag.ItemIsUserCheckable
-                    | Qt.ItemFlag.ItemIsAutoTristate
-                )
-                self._tree.addTopLevelItem(node)
-                ds_nodes[ds] = node
+                ds_nodes[ds] = self._make_parent_node(ds, "")
+                self._tree.addTopLevelItem(ds_nodes[ds])
             if (ds, sub) not in sub_nodes:
-                node = QTreeWidgetItem([self._format_label(sub, "")])
-                node.setFlags(
-                    node.flags()
-                    | Qt.ItemFlag.ItemIsUserCheckable
-                    | Qt.ItemFlag.ItemIsAutoTristate
-                )
-                ds_nodes[ds].addChild(node)
-                sub_nodes[(ds, sub)] = node
+                sub_nodes[(ds, sub)] = self._make_parent_node(sub, "")
+                ds_nodes[ds].addChild(sub_nodes[(ds, sub)])
             parent_for_dt = sub_nodes[(ds, sub)]
             if ses:
                 if (ds, sub, ses) not in ses_nodes:
-                    node = QTreeWidgetItem([self._format_label(ses, "")])
-                    node.setFlags(
-                        node.flags()
-                        | Qt.ItemFlag.ItemIsUserCheckable
-                        | Qt.ItemFlag.ItemIsAutoTristate
-                    )
-                    sub_nodes[(ds, sub)].addChild(node)
-                    ses_nodes[(ds, sub, ses)] = node
+                    ses_nodes[(ds, sub, ses)] = self._make_parent_node(ses, "")
+                    sub_nodes[(ds, sub)].addChild(ses_nodes[(ds, sub, ses)])
                 parent_for_dt = ses_nodes[(ds, sub, ses)]
+            if (ds, sub, ses, dt) not in dt_nodes:
+                dt_nodes[(ds, sub, ses, dt)] = self._make_parent_node(
+                    dt, f"   {len(entries)}",
+                )
+                parent_for_dt.addChild(dt_nodes[(ds, sub, ses, dt)])
 
-            leaf = QTreeWidgetItem([self._format_label(dt, f"   {len(row_ids)}")])
-            leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            leaf.setData(0, _ROW_IDS_ROLE, tuple(row_ids))
-            # Initial check state: derived from the union of include flags.
-            states = {self._model._read_include(r) for r in row_ids}
-            if states == {True}:
-                leaf.setCheckState(0, Qt.CheckState.Checked)
-            elif states == {False}:
-                leaf.setCheckState(0, Qt.CheckState.Unchecked)
-            else:
-                leaf.setCheckState(0, Qt.CheckState.PartiallyChecked)
-            parent_for_dt.addChild(leaf)
+            # --- one leaf per sequence under the datatype ---
+            for row_idx, label in entries:
+                leaf = QTreeWidgetItem([label])
+                leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                leaf.setData(0, _ROW_IDS_ROLE, (row_idx,))
+                included = self._model._read_include(row_idx)
+                leaf.setCheckState(
+                    0,
+                    Qt.CheckState.Checked if included else Qt.CheckState.Unchecked,
+                )
+                dt_nodes[(ds, sub, ses, dt)].addChild(leaf)
 
         self._tree.expandAll()
+
+    def _make_parent_node(self, label: str, suffix: str) -> QTreeWidgetItem:
+        """Build a tri-state parent node (dataset / sub / ses / datatype)."""
+        node = QTreeWidgetItem([self._format_label(label, suffix)])
+        node.setFlags(
+            node.flags()
+            | Qt.ItemFlag.ItemIsUserCheckable
+            | Qt.ItemFlag.ItemIsAutoTristate
+        )
+        return node
+
+    @staticmethod
+    def _sequence_label(df, row_idx: int) -> str:
+        """Pick the most informative label for a sequence leaf.
+
+        Prefers ``proposed_basename`` (the BIDS-shaped name the user is
+        about to commit to). Falls back to the original DICOM
+        SeriesDescription (``sequence`` column for MRI), then the
+        ``source_file`` stem for EEG/MEG rows without a basename yet.
+        """
+        for col in ("proposed_basename", "sequence", "source_file"):
+            if col not in df.columns:
+                continue
+            raw = df.at[row_idx, col]
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if not text:
+                continue
+            if col == "source_file":
+                return text.split("/")[-1]
+            return text
+        return f"row {row_idx + 1}"
 
     @staticmethod
     def _format_label(label: str, suffix: str) -> str:

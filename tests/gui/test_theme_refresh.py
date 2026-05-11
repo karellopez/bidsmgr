@@ -25,20 +25,62 @@ from bidsmgr.gui.theme_manager import ThemeManager
 pytestmark = pytest.mark.gui
 
 
-def test_logo_gradient_changes_on_theme_toggle(qapp) -> None:
+def test_logo_loads_bundled_pixmap(qapp) -> None:
+    """The brand logo now uses the bundled PNG asset; the label should
+    carry a non-null QPixmap (not an inline-gradient stylesheet).
+    """
     theme = ThemeManager(qapp)
     theme.apply("dark")
     win = MainWindow(theme)
     qapp.processEvents()
 
-    dark_style = win._header._logo.styleSheet()
+    pix = win._header._logo.pixmap()
+    assert pix is not None and not pix.isNull(), (
+        "expected the bundled logo.png to load; got an empty pixmap"
+    )
+    # The logo survives a theme toggle (it's reloaded from the same
+    # asset; we only check that the pixmap stays valid, not identical).
     theme.toggle()
-    light_style = win._header._logo.styleSheet()
+    assert not win._header._logo.pixmap().isNull()
 
-    assert dark_style != light_style
-    # dark accent is #58a6ff; light accent is #0969da.
-    assert "#58a6ff" in dark_style
-    assert "#0969da" in light_style
+
+def test_logo_inverts_in_dark_theme(qapp) -> None:
+    """Dark theme inverts the bundled PNG so the dark-on-transparent
+    artwork reads as light-on-transparent against the dark surface.
+    Sampled by hashing a center scanline of pixel RGB.
+    """
+    theme = ThemeManager(qapp)
+    win = MainWindow(theme)
+
+    def _sample_pixel(pix) -> tuple[int, int, int, int]:
+        # Convert to image and read a pixel that's likely opaque
+        # (centre of the logo, which on the source PNG is ink, not
+        # background).
+        img = pix.toImage()
+        cx, cy = img.width() // 2, img.height() // 2
+        c = img.pixelColor(cx, cy)
+        return (c.red(), c.green(), c.blue(), c.alpha())
+
+    theme.apply("light")
+    qapp.processEvents()
+    light_pixel = _sample_pixel(win._header._logo.pixmap())
+
+    theme.apply("dark")
+    qapp.processEvents()
+    dark_pixel = _sample_pixel(win._header._logo.pixmap())
+
+    # The two pixels should differ: ``invertPixels(InvertRgb)`` flips
+    # RGB while preserving alpha, so r/g/b differ but alpha stays.
+    assert light_pixel != dark_pixel
+    assert light_pixel[3] == dark_pixel[3]  # alpha preserved
+    # If the source was an ink pixel (say RGB ~(20,20,20,255)) it
+    # inverts to ~(235,235,235,255). Sum of channels should rise.
+    if light_pixel[3] > 0:
+        light_sum = sum(light_pixel[:3])
+        dark_sum = sum(dark_pixel[:3])
+        # Inversion preserves total: r+g+b in light + r+g+b in dark
+        # ≈ 3 * 255 = 765 (per channel: x + (255-x) = 255).
+        assert abs((light_sum + dark_sum) - 3 * 255) < 6
 
 
 def test_converter_panel_repaint_listener_fires(qapp, monkeypatch) -> None:

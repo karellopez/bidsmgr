@@ -12,8 +12,10 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from pathlib import Path
+
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -51,10 +53,14 @@ class _TopHeader(QFrame):
         h.setContentsMargins(14, 6, 14, 6)
         h.setSpacing(10)
 
-        self._logo = QLabel("B")
-        self._logo.setFixedSize(24, 24)
+        # Brand logo + name. The bundled PNG ships in
+        # ``bidsmgr/gui/assets/logo.png``; we fall back to a gradient-B
+        # placeholder if the asset can't be loaded for any reason
+        # (e.g. running from a partial source tree).
+        self._logo = QLabel()
+        self._logo.setFixedSize(28, 24)
         self._logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._apply_logo_gradient(theme.palette)
+        self._apply_logo_pixmap(theme.palette)
         name = QLabel("BIDS-Manager")
         name.setObjectName("brand-name")
         h.addWidget(self._logo)
@@ -75,16 +81,55 @@ class _TopHeader(QFrame):
         self._theme_btn.setText("☀" if new == "dark" else "☾")
         AppSettings.remember_theme(new)
 
-    def _apply_logo_gradient(self, pal: dict) -> None:
+    def _apply_logo_pixmap(self, pal: dict) -> None:
+        """Load the bundled PNG into the logo label.
+
+        The PNG is drawn dark-on-transparent for a light background.
+        On a dark theme we invert the RGB channels (keeping alpha) so
+        the same artwork reads as light-on-transparent against the
+        dark surface. Falls back to a gradient-B if the asset can't
+        be loaded.
+        """
+        png = Path(__file__).parent / "assets" / "logo.png"
+        if png.exists():
+            img = QImage(str(png))
+            if not img.isNull():
+                if self._is_dark_theme(pal):
+                    # ``InvertRgb`` flips R/G/B; alpha is preserved so
+                    # the transparent background stays transparent.
+                    img.invertPixels(QImage.InvertMode.InvertRgb)
+                pix = QPixmap.fromImage(img)
+                self._logo.setPixmap(pix.scaledToHeight(
+                    24,
+                    Qt.TransformationMode.SmoothTransformation,
+                ))
+                # Drop any leftover stylesheet from a previous gradient
+                # render so the transparent PNG sits flat.
+                self._logo.setStyleSheet("")
+                self._logo.setText("")
+                return
+        # Fallback path — keep the GUI usable even without the asset.
+        self._logo.setText("B")
         self._logo.setStyleSheet(
             "background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
             f"stop:0 {pal['accent']}, stop:1 {pal['purple']});"
             "color: white; border-radius: 6px; font-weight: 700;"
         )
 
+    @staticmethod
+    def _is_dark_theme(pal: dict) -> bool:
+        """Heuristic: average RGB of ``pal['bg']`` below 128 → dark."""
+        bg = pal.get("bg", "#000000").lstrip("#")
+        if len(bg) < 6:
+            return False
+        r = int(bg[0:2], 16)
+        g = int(bg[2:4], 16)
+        b = int(bg[4:6], 16)
+        return (r + g + b) / 3 < 128
+
     def repaint_for_palette(self, pal: dict) -> None:
-        """Reapply palette-derived inline styles (logo gradient)."""
-        self._apply_logo_gradient(pal)
+        """Reload the logo under the new palette (inverts when dark)."""
+        self._apply_logo_pixmap(pal)
 
 
 class MainWindow(QMainWindow):

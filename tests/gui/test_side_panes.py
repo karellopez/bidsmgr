@@ -229,12 +229,68 @@ def test_filter_pane_partial_state_when_rows_mixed(qtbot) -> None:
     qtbot.addWidget(pane)
     pane.bind_model(model)
 
-    # The leaf datatype node (func) has two children with disagreeing
-    # include flags → partial.
+    # New shape: ds → sub → ses → datatype (parent) → sequence (leaves).
+    # The datatype parent has two child sequences with disagreeing
+    # include flags → tri-state partial via Qt's ItemIsAutoTristate.
     ds = pane._tree.topLevelItem(0)
     sub = ds.child(0)
     ses = sub.child(0)
-    # There's a single datatype leaf with both row_ids; its state is
-    # derived from the union of include flags.
-    leaf = ses.child(0)
-    assert leaf.checkState(0) == Qt.CheckState.PartiallyChecked
+    datatype_parent = ses.child(0)
+    # Datatype parent has 2 sequence-leaf children.
+    assert datatype_parent.childCount() == 2
+    assert datatype_parent.checkState(0) == Qt.CheckState.PartiallyChecked
+
+
+def test_filter_pane_per_sequence_leaves_show_basenames(qtbot) -> None:
+    """Each sequence under a datatype is its own leaf labeled by
+    ``proposed_basename`` (or fallback)."""
+    df = make_df([
+        _func_row(proposed_basename="sub-001_ses-pre_task-rest_bold", series_uid="1.1"),
+        _func_row(proposed_basename="sub-001_ses-pre_task-mb_bold",   series_uid="2.2"),
+    ])
+    model = InventoryTableModel(df)
+    pane = FilterPane()
+    qtbot.addWidget(pane)
+    pane.bind_model(model)
+
+    ds = pane._tree.topLevelItem(0)
+    sub = ds.child(0)
+    ses = sub.child(0)
+    dt = ses.child(0)
+    labels = [dt.child(i).text(0) for i in range(dt.childCount())]
+    assert "sub-001_ses-pre_task-rest_bold" in labels
+    assert "sub-001_ses-pre_task-mb_bold" in labels
+
+
+def test_filter_pane_unchecking_one_sequence_only_toggles_that_row(qtbot) -> None:
+    """Unticking a single sequence leaf must only affect THAT row's
+    include flag — not the whole datatype group.
+    """
+    df = make_df([
+        _func_row(proposed_basename="sub-001_ses-pre_task-rest_bold",
+                  series_uid="1.1"),
+        _func_row(proposed_basename="sub-001_ses-pre_task-mb_bold",
+                  series_uid="2.2"),
+    ])
+    model = InventoryTableModel(df)
+    pane = FilterPane()
+    qtbot.addWidget(pane)
+    pane.bind_model(model)
+
+    ds = pane._tree.topLevelItem(0)
+    sub = ds.child(0)
+    ses = sub.child(0)
+    dt = ses.child(0)
+
+    # Find the leaf for the first basename and uncheck it.
+    target = None
+    for i in range(dt.childCount()):
+        if dt.child(i).text(0) == "sub-001_ses-pre_task-rest_bold":
+            target = dt.child(i)
+            break
+    assert target is not None
+    target.setCheckState(0, Qt.CheckState.Unchecked)
+
+    # Row 0 now excluded; row 1 still included.
+    assert model._read_include(0) is False
+    assert model._read_include(1) is True
