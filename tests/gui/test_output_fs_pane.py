@@ -26,6 +26,24 @@ from bidsmgr.gui.output_fs_pane import OutputFsPane
 pytestmark = pytest.mark.gui
 
 
+def _wait_scan_idle(qtbot, pane: OutputFsPane, timeout: int = 5000) -> None:
+    """Block until the pane's background scan has caught up.
+
+    The pane's disk walk runs on the global ``QThreadPool``; its result
+    arrives on the GUI event loop via a queued signal. Tests that
+    assert on the rendered tree must wait until the latest request
+    has produced output (or was synchronously short-circuited to an
+    empty state).
+    """
+    qtbot.waitUntil(
+        lambda: (
+            not pane._scan_in_progress
+            and pane._completed_scan_generation == pane._scan_generation
+        ),
+        timeout=timeout,
+    )
+
+
 # ---------------------------------------------------------------------------
 # OutputFsPane standalone
 # ---------------------------------------------------------------------------
@@ -53,8 +71,10 @@ def test_pane_populates_from_a_bids_tree(qtbot, tmp_path: Path) -> None:
     qtbot.waitExposed(pane)
     pane.set_root(tmp_path)
 
+    # Visibility flips synchronously; the populated tree arrives off-thread.
     assert pane._tree.isVisible()
     assert not pane._empty.isVisible()
+    _wait_scan_idle(qtbot, pane)
 
     def walk(item):
         yield item.text(0)
@@ -77,7 +97,10 @@ def test_pane_clears_on_none(qtbot, tmp_path: Path) -> None:
     qtbot.waitExposed(pane)
     (tmp_path / "x").mkdir()
     pane.set_root(tmp_path)
+    _wait_scan_idle(qtbot, pane)
     pane.set_root(None)
+    # ``set_root(None)`` short-circuits synchronously — the tree
+    # clears and the empty hint flips back without waiting on disk.
     assert pane._empty.isVisible()
     assert pane._tree.topLevelItemCount() == 0
 
@@ -125,6 +148,7 @@ def test_user_expansion_survives_rebuild(qtbot, tmp_path: Path) -> None:
     pane.show()
     qtbot.waitExposed(pane)
     pane.set_root(tmp_path)
+    _wait_scan_idle(qtbot, pane)
 
     # ``study`` is auto-expanded on first render. Collapse it manually.
     item_study = _find_item(pane, (tmp_path.name, "study"))
@@ -135,6 +159,7 @@ def test_user_expansion_survives_rebuild(qtbot, tmp_path: Path) -> None:
 
     # Trigger a rebuild (simulates a watcher event mid-conversion).
     pane._rebuild()
+    _wait_scan_idle(qtbot, pane)
     item_study2 = _find_item(pane, (tmp_path.name, "study"))
     assert item_study2 is not None
     # Collapsed state preserved.
@@ -149,11 +174,13 @@ def test_user_expanded_deep_path_survives_rebuild(qtbot, tmp_path: Path) -> None
     pane.show()
     qtbot.waitExposed(pane)
     pane.set_root(tmp_path)
+    _wait_scan_idle(qtbot, pane)
 
     sub = _find_item(pane, (tmp_path.name, "study", "sub-001"))
     assert sub is not None
     sub.setExpanded(True)
     pane._rebuild()
+    _wait_scan_idle(qtbot, pane)
     sub_after = _find_item(pane, (tmp_path.name, "study", "sub-001"))
     assert sub_after is not None and sub_after.isExpanded()
 
@@ -165,11 +192,13 @@ def test_user_selection_survives_rebuild(qtbot, tmp_path: Path) -> None:
     pane.show()
     qtbot.waitExposed(pane)
     pane.set_root(tmp_path)
+    _wait_scan_idle(qtbot, pane)
 
     target = _find_item(pane, (tmp_path.name, "study", "sub-001"))
     pane._tree.setCurrentItem(target)
     assert pane._tree.currentItem() is target
     pane._rebuild()
+    _wait_scan_idle(qtbot, pane)
     new_cur = pane._tree.currentItem()
     assert new_cur is not None
     assert pane._item_path(new_cur) == (tmp_path.name, "study", "sub-001")
@@ -186,6 +215,7 @@ def test_pane_live_refreshes_when_file_created(qtbot, tmp_path: Path) -> None:
     pane.show()
     qtbot.waitExposed(pane)
     pane.set_root(tmp_path)
+    _wait_scan_idle(qtbot, pane)
     assert "marker.tsv" not in str(_walk_labels(pane))
 
     (tmp_path / "study" / "marker.tsv").write_text("x\n")
@@ -209,6 +239,7 @@ def test_pane_live_refreshes_when_dir_deleted(qtbot, tmp_path: Path) -> None:
     pane.show()
     qtbot.waitExposed(pane)
     pane.set_root(tmp_path)
+    _wait_scan_idle(qtbot, pane)
     assert any("leaf.tsv" in lbl for lbl in _walk_labels(pane))
 
     shutil.rmtree(tmp_path / "study")
@@ -224,6 +255,7 @@ def test_pane_refreshes_after_files_appear(qtbot, tmp_path: Path) -> None:
     pane.show()
     qtbot.waitExposed(pane)
     pane.set_root(tmp_path)
+    _wait_scan_idle(qtbot, pane)
 
     # Initially empty (the dir exists but has no children).
     def walk(item):
@@ -240,6 +272,7 @@ def test_pane_refreshes_after_files_appear(qtbot, tmp_path: Path) -> None:
     (tmp_path / "study" / "sub-001" / "sub-001_T1w.nii.gz").write_bytes(b"")
 
     pane.refresh()
+    _wait_scan_idle(qtbot, pane)
     labels_after: list[str] = []
     for i in range(pane._tree.topLevelItemCount()):
         labels_after.extend(walk(pane._tree.topLevelItem(i)))
@@ -281,6 +314,7 @@ def test_convert_finished_refreshes_output_pane(qtbot, tmp_path: Path) -> None:
     (bids_parent / "study" / "marker.tsv").write_text("x\n")
 
     panel._on_convert_finished(rc=0, bids_parent=bids_parent)
+    _wait_scan_idle(qtbot, panel._output_pane)
 
     # Walk the rendered tree and assert the marker file is present.
     def walk(item):

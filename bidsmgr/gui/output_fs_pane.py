@@ -10,16 +10,33 @@ conversion finishes.
 No model coupling — the output tree is purely "what's on disk under
 the BIDS root". The user sees the converted layout grow as workers
 finish.
+
+Threading: the recursive ``os.scandir`` walk runs on the global
+``QThreadPool``. The GUI thread only does cheap work — building
+``QTreeWidgetItem`` objects from the plain tree the worker produced,
+registering watcher paths, and (de)serialising user state. A
+generation counter on every scan request drops stale results, so
+rapid fire-and-forget rebuilds (e.g. dcm2niix dropping many files
+during a conversion) cannot interleave.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QFileSystemWatcher, Qt, QTimer
+from PyQt6.QtCore import (
+    QFileSystemWatcher,
+    QObject,
+    QRunnable,
+    Qt,
+    QThreadPool,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QLabel,
@@ -47,6 +64,10 @@ _SKIP_DIRS: frozenset[str] = frozenset({
     "node_modules", ".idea", ".vscode",
 })
 
+# Item data role used to remember the palette token a leaf was rendered
+# with, so theme toggles can re-color in place without re-walking disk.
+_COLOR_TOKEN_ROLE = Qt.ItemDataRole.UserRole + 1
+
 
 def _color_token_for(path_name: str) -> str:
     """Pick the palette token used to color a leaf file.
@@ -64,13 +85,123 @@ def _color_token_for(path_name: str) -> str:
     return "dim"
 
 
+# ---------------------------------------------------------------------------
+# Off-thread scan
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _TreeNode:
+    """Plain-data representation of a folder/file produced off-thread."""
+
+    name: str
+    is_dir: bool
+    color_token: str
+    children: list["_TreeNode"] = field(default_factory=list)
+
+
+@dataclass
+class _ScanResult:
+    root: _TreeNode
+    dirs_to_watch: list[str]
+
+
+class _ScanSignals(QObject):
+    """Bridges a worker-thread scan back to the GUI thread.
+
+    Held on the pane (parented for QObject lifetime). ``QueuedConnection``
+    is enforced when wiring the slot so the emit hops to the GUI event
+    loop even when fired from the thread pool.
+    """
+
+    done = pyqtSignal(int, object)  # (generation, _ScanResult | None)
+
+
+class _ScanRunnable(QRunnable):
+    """Recursive directory walk that runs on the global thread pool.
+
+    The walk produces a ``_TreeNode`` tree + the list of directory
+    paths the GUI thread should register with the watcher. Any IO
+    error short-circuits to ``None`` so the GUI thread can fall back
+    to the empty-state hint.
+    """
+
+    def __init__(self, generation: int, root: Path, signals: _ScanSignals) -> None:
+        super().__init__()
+        self._generation = generation
+        self._root = root
+        self._signals = signals
+
+    def run(self) -> None:
+        result: Optional[_ScanResult]
+        try:
+            if not self._root.exists():
+                result = None
+            else:
+                root_node = _TreeNode(
+                    name=self._root.name or str(self._root),
+                    is_dir=True,
+                    color_token="text",
+                )
+                dirs: list[str] = [str(self._root)]
+                _walk_dir(self._root, root_node, depth=0, dirs=dirs)
+                result = _ScanResult(root=root_node, dirs_to_watch=dirs)
+        except Exception:  # pragma: no cover — defensive
+            log.exception("output tree scan failed for %s", self._root)
+            result = None
+        self._signals.done.emit(self._generation, result)
+
+
+def _walk_dir(
+    folder: Path,
+    parent: _TreeNode,
+    *,
+    depth: int,
+    dirs: list[str],
+) -> None:
+    if depth >= _MAX_DEPTH:
+        return
+    try:
+        entries = sorted(
+            os.scandir(folder),
+            key=lambda e: (not e.is_dir(), e.name.lower()),
+        )
+    except (PermissionError, FileNotFoundError) as exc:
+        log.debug("scandir failed for %s: %s", folder, exc)
+        return
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        if entry.name in _SKIP_DIRS:
+            continue
+        if entry.is_dir():
+            node = _TreeNode(name=entry.name, is_dir=True, color_token="accent")
+            parent.children.append(node)
+            dirs.append(entry.path)
+            _walk_dir(Path(entry.path), node, depth=depth + 1, dirs=dirs)
+        else:
+            node = _TreeNode(
+                name=entry.name,
+                is_dir=False,
+                color_token=_color_token_for(entry.name),
+            )
+            parent.children.append(node)
+
+
+# ---------------------------------------------------------------------------
+# Pane
+# ---------------------------------------------------------------------------
+
+
 class OutputFsPane(QWidget):
     """Filesystem tree of the BIDS output directory.
 
     Construct, call :meth:`set_root` once a target path is known.
     Re-call :meth:`set_root` (or just :meth:`refresh`) after every
     conversion run so newly-produced files appear without an app
-    restart.
+    restart. The actual disk walk runs on the global ``QThreadPool``;
+    test code that needs to observe the resulting tree should poll
+    with ``qtbot.waitUntil`` rather than asserting immediately.
     """
 
     def __init__(self, parent=None) -> None:
@@ -79,19 +210,30 @@ class OutputFsPane(QWidget):
         self.setMinimumWidth(200)
 
         self._root: Optional[Path] = None
+        self._last_rendered_root: Optional[Path] = None
+
+        # Scan bookkeeping. ``_scan_generation`` increments on each
+        # rebuild request; ``_on_scan_done`` drops any result whose
+        # generation no longer matches (stale). ``_completed_scan_generation``
+        # lets tests poll for completion without scraping the tree.
+        self._scan_generation = 0
+        self._completed_scan_generation = 0
+        self._scan_in_progress = False
+        self._scan_signals = _ScanSignals(self)
+        self._scan_signals.done.connect(
+            self._on_scan_done,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
         # Live refresh: every visible directory is registered with a
         # ``QFileSystemWatcher`` so creates / deletes / renames trigger
         # a rebuild. Multiple rapid events (e.g. dcm2niix dropping many
-        # files at once) are coalesced through a 250 ms debounce timer
+        # files at once) are coalesced through a 500 ms debounce timer
         # to avoid thrashing the QTreeWidget.
         self._watcher = QFileSystemWatcher(self)
         self._watcher.directoryChanged.connect(self._on_fs_changed)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
-        # 500 ms: a bit slower than the original 250 ms so a long burst
-        # of writes (dcm2niix dropping many files in a row) only fires
-        # the rebuild once per "frame" instead of fighting the user.
         self._refresh_timer.setInterval(500)
         self._refresh_timer.timeout.connect(self._rebuild)
 
@@ -129,7 +271,8 @@ class OutputFsPane(QWidget):
 
         ``None`` clears the tree back to the empty state. Calling with
         the same path forces a refresh (so workers can re-populate
-        after conversion completes).
+        after conversion completes). The scan itself runs on a
+        worker thread; the tree updates when its result arrives.
         """
         self._root = Path(root) if root is not None else None
         self._rebuild()
@@ -139,20 +282,77 @@ class OutputFsPane(QWidget):
         self._rebuild()
 
     def repaint_for_palette(self, _pal: dict) -> None:
-        """Re-render the tree so per-item foreground colors update.
+        """Re-color existing tree items for the new palette.
 
-        Tree items carry palette-derived foregrounds (dir = accent,
-        ``.nii.gz`` = text, ``.json`` = purple, ``.tsv`` = teal). A
-        fresh palette needs a re-populate to flow through.
+        Each item stores the palette token it was rendered with
+        (see ``_COLOR_TOKEN_ROLE``). A theme toggle just walks the
+        widget and rewrites foregrounds — no disk re-walk, no
+        watcher churn, no flicker.
         """
-        if self._root is not None:
-            self._rebuild()
+        if self._tree.topLevelItemCount() == 0:
+            return
+        pal = CUR()
+        for i in range(self._tree.topLevelItemCount()):
+            _recolor(self._tree.topLevelItem(i), pal)
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
     def _rebuild(self) -> None:
+        # Empty-state and root-changed paths run synchronously so the
+        # user never sees stale content from a different dataset.
+        if self._root is None or not self._root.exists():
+            self._tree.clear()
+            self._clear_watcher()
+            self._tree.setVisible(False)
+            self._empty.setVisible(True)
+            self._last_rendered_root = None
+            # Advance generation + mark as completed so any in-flight
+            # scan result is treated as stale and tests waiting on
+            # quiescence wake up immediately.
+            self._scan_generation += 1
+            self._completed_scan_generation = self._scan_generation
+            self._scan_in_progress = False
+            return
+
+        if self._last_rendered_root != self._root:
+            # Different root than what's currently on screen — clear
+            # immediately so the user doesn't see the previous tree
+            # while the new scan runs.
+            self._tree.clear()
+            self._clear_watcher()
+
+        self._empty.setVisible(False)
+        self._tree.setVisible(True)
+
+        self._scan_generation += 1
+        self._scan_in_progress = True
+        runnable = _ScanRunnable(
+            self._scan_generation, self._root, self._scan_signals,
+        )
+        QThreadPool.globalInstance().start(runnable)
+
+    def _on_scan_done(
+        self,
+        generation: int,
+        result: Optional[_ScanResult],
+    ) -> None:
+        if generation != self._scan_generation:
+            # Newer scan already queued — drop this one's output.
+            return
+        self._scan_in_progress = False
+        self._completed_scan_generation = generation
+
+        if result is None:
+            # Root vanished between queueing and the scan running.
+            self._tree.clear()
+            self._clear_watcher()
+            self._tree.setVisible(False)
+            self._empty.setVisible(True)
+            self._last_rendered_root = None
+            return
+
         # Snapshot whatever interactive state the user has on the tree
         # before we blow it away. Without this, a watcher-triggered
         # refresh in the middle of e.g. expanding ``sub-001/anat`` would
@@ -162,27 +362,14 @@ class OutputFsPane(QWidget):
         snap = self._snapshot_state() if had_content else None
 
         self._tree.clear()
-        # Drop every existing watch — we'll re-add the visible dirs as
-        # we walk. Cheap; ``directories()`` is small (max few hundred
-        # entries for typical BIDS trees).
-        existing = self._watcher.directories()
-        if existing:
-            self._watcher.removePaths(existing)
-
-        if self._root is None or not self._root.exists():
-            self._tree.setVisible(False)
-            self._empty.setVisible(True)
-            return
-        self._empty.setVisible(False)
-        self._tree.setVisible(True)
+        self._clear_watcher()
+        if result.dirs_to_watch:
+            # ``addPaths`` is one syscall round-trip rather than one per dir.
+            self._watcher.addPaths(result.dirs_to_watch)
 
         pal = CUR()
-        root_item = QTreeWidgetItem([self._root.name or str(self._root)])
-        root_item.setForeground(0, QColor(pal["text"]))
+        root_item = _render_node(result.root, pal)
         self._tree.addTopLevelItem(root_item)
-        # Watch the root + everything underneath that we render.
-        self._watcher.addPath(str(self._root))
-        self._populate(self._root, root_item, depth=0)
         root_item.setExpanded(True)
 
         if snap is None:
@@ -195,43 +382,12 @@ class OutputFsPane(QWidget):
             # Subsequent rebuilds — defer to whatever the user had open.
             self._restore_state(snap)
 
-    def _populate(
-        self,
-        folder: Path,
-        parent: QTreeWidgetItem,
-        *,
-        depth: int,
-    ) -> None:
-        if depth >= _MAX_DEPTH:
-            return
-        try:
-            entries = sorted(
-                os.scandir(folder),
-                key=lambda e: (not e.is_dir(), e.name.lower()),
-            )
-        except (PermissionError, FileNotFoundError) as exc:
-            log.debug("scandir failed for %s: %s", folder, exc)
-            return
+        self._last_rendered_root = self._root
 
-        pal = CUR()
-        for entry in entries:
-            if entry.name.startswith("."):
-                continue
-            if entry.name in _SKIP_DIRS:
-                continue
-            child = QTreeWidgetItem([entry.name])
-            parent.addChild(child)
-            if entry.is_dir():
-                child.setForeground(0, QColor(pal["accent"]))
-                # Subscribe to changes inside this dir too so creating
-                # / deleting files deep in the tree triggers a refresh.
-                self._watcher.addPath(entry.path)
-                self._populate(
-                    Path(entry.path), child, depth=depth + 1,
-                )
-            else:
-                color = pal[_color_token_for(entry.name)]
-                child.setForeground(0, QColor(color))
+    def _clear_watcher(self) -> None:
+        existing = self._watcher.directories()
+        if existing:
+            self._watcher.removePaths(existing)
 
     def _on_fs_changed(self, _path: str) -> None:
         """One or more watched dirs changed — schedule a debounced refresh.
@@ -306,6 +462,28 @@ class OutputFsPane(QWidget):
         for i in range(self._tree.topLevelItemCount()):
             _walk(self._tree.topLevelItem(i))
         self._tree.verticalScrollBar().setValue(snap["scroll"])
+
+
+def _render_node(node: _TreeNode, pal: dict) -> QTreeWidgetItem:
+    """Translate a worker-produced ``_TreeNode`` into a ``QTreeWidgetItem``.
+
+    The palette token used is also stamped onto the item so
+    :meth:`OutputFsPane.repaint_for_palette` can re-color it later
+    without re-walking disk.
+    """
+    item = QTreeWidgetItem([node.name])
+    item.setData(0, _COLOR_TOKEN_ROLE, node.color_token)
+    item.setForeground(0, QColor(pal[node.color_token]))
+    for child in node.children:
+        item.addChild(_render_node(child, pal))
+    return item
+
+
+def _recolor(item: QTreeWidgetItem, pal: dict) -> None:
+    token = item.data(0, _COLOR_TOKEN_ROLE) or "text"
+    item.setForeground(0, QColor(pal[token]))
+    for i in range(item.childCount()):
+        _recolor(item.child(i), pal)
 
 
 __all__ = ["OutputFsPane"]

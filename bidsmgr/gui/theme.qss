@@ -657,11 +657,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: t
  * Busy spinner (toolbar)
  * ------------------------------------------------------------------ */
 QWidget#busy-spinner { background: transparent; }
-QLabel#busy-spinner-glyph {
-    color: $accent;
-    font-size: 14px;
-    font-weight: 700;
-}
+QWidget#busy-spinner-glyph { background: transparent; }
 QLabel#busy-spinner-message {
     color: $dim;
     font-size: 11px;
