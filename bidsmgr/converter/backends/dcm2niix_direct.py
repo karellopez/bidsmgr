@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Optional
 
 from ...classifier.dcm2niix_bidsguess import find_dcm2niix
+from ...util.paths import long_path
 from ..types import ConvertResult, ConvertTask
 
 log = logging.getLogger(__name__)
@@ -199,9 +200,22 @@ def _safe_dicoms_dirname(series_uid: str) -> str:
 
 
 def _stage_dicoms(source_files, staging_dir: Path) -> int:
-    """Symlink the source DICOMs into ``staging_dir``. Returns count staged."""
+    """Symlink (or copy on Windows w/o symlink-priv) the source DICOMs.
+
+    Returns the number of files actually staged. The destination path
+    is funnelled through :func:`long_path` so that deep Windows BIDS
+    trees do not hit the 260-char ``MAX_PATH`` limit at the symlink
+    syscall — pathlib's ``Path`` machinery sometimes still routes
+    through narrow-string APIs on older interpreters.
+
+    On Windows, creating a symbolic link requires either the
+    ``SeCreateSymbolicLinkPrivilege`` (granted in Developer Mode) or
+    an Administrator process. When ``os.symlink`` raises
+    ``OSError(WinError 1314)`` we fall back to a plain file copy so
+    end users without those privileges still get a working batch.
+    """
     if staging_dir.exists():
-        shutil.rmtree(staging_dir)
+        shutil.rmtree(long_path(staging_dir), ignore_errors=False)
     staging_dir.mkdir(parents=True)
     n = 0
     seen: set[str] = set()
@@ -221,11 +235,21 @@ def _stage_dicoms(source_files, staging_dir: Path) -> int:
             link_name = f"{stem}_{i}{src.suffix}"
         seen.add(link_name)
         link = staging_dir / link_name
+        src_resolved = src.resolve()
         try:
-            os.symlink(src.resolve(), link)
+            os.symlink(long_path(src_resolved), long_path(link))
         except FileExistsError:
-            link.unlink()
-            os.symlink(src.resolve(), link)
+            os.unlink(long_path(link))
+            os.symlink(long_path(src_resolved), long_path(link))
+        except OSError as exc:
+            # Windows error 1314: "A required privilege is not held by
+            # the client." (SeCreateSymbolicLinkPrivilege missing.)
+            # Fall back to a plain copy so non-admin Windows users
+            # still convert. Other OSErrors propagate so we see them.
+            if getattr(exc, "winerror", None) == 1314:
+                shutil.copyfile(long_path(src_resolved), long_path(link))
+            else:
+                raise
         n += 1
     return n
 

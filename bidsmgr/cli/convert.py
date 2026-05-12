@@ -56,6 +56,7 @@ from ..converter import (
     select_backend,
 )
 from ..fixups import apply_fieldmap_renames, populate_intended_for, update_scans_tsv
+from ..util.paths import long_path, safe_path_component
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +89,18 @@ def run_convert(
     """
     tsv = Path(tsv)
     bids_parent = Path(bids_parent)
+
+    # One-line version banner so a user's conversion log unambiguously
+    # records which copy of the package executed (matters when the same
+    # machine has both a pip-installed and a dev-checkout install, or
+    # when a Windows user pulled but is still running a stale process).
+    log.info(
+        "bidsmgr %s @ %s | platform=%s py=%s",
+        bidsmgr.__version__,
+        Path(bidsmgr.__file__).resolve().parent,
+        sys.platform,
+        sys.version.split()[0],
+    )
 
     # Candidates the EEG/MEG row resolver uses when ``source_file`` is
     # stored relative-to-raw-root in the inventory TSV. We try (in order):
@@ -207,7 +220,11 @@ def _convert_subject(
 ) -> None:
     """Run Phases 1–3 for a single (dataset, subject, session) group."""
     subject = tasks[0].subject
-    staging = bids_root / ".tmp_bidsmgr" / f"sub-{subject}"
+    # Subject label is inventory-derived (user-editable). Sanitise into
+    # a portable path component so a stray ``|``, ``:`` or trailing dot
+    # cannot wedge ``mkdir`` on Windows.
+    subj_segment = f"sub-{safe_path_component(subject)}"
+    staging = bids_root / ".tmp_bidsmgr" / subj_segment
     staging.mkdir(parents=True, exist_ok=True)
 
     results: list[ConvertResult] = []
@@ -228,8 +245,10 @@ def _convert_subject(
         )
         _prune_empty_dirs(staging)
 
-        # Phase 3: atomic commit.
-        target = bids_root / f"sub-{subject}"
+        # Phase 3: atomic commit. Use the same sanitised segment we
+        # built for the staging dir so the commit target name is
+        # consistent across OSes.
+        target = bids_root / subj_segment
         _atomic_commit(staging, target, overwrite=overwrite)
         _write_provenance(
             target, results, rename_map, n_intended_for, n_scans_tsv,
@@ -242,7 +261,7 @@ def _convert_subject(
         # Phase 1 finished before something went wrong.
         if not results:
             failed_phase = "phase1"
-        elif not (bids_root / f"sub-{subject}").exists():
+        elif not (bids_root / subj_segment).exists():
             failed_phase = "phase2_or_phase3"
         else:
             failed_phase = "phase3_provenance"
@@ -320,7 +339,13 @@ def _phase1_one(backends: list, task: ConvertTask, staging: Path) -> ConvertResu
     subdir (when the task has a session) so the backend writes to
     ``<staging>/ses-<label>/<datatype>/``.
     """
-    target_root = staging if not task.session else staging / f"ses-{task.session}"
+    # Session label is inventory-derived (user-editable). Run it
+    # through ``safe_path_component`` so an illegal-on-Windows char
+    # (``|``, ``:``, trailing dot, …) cannot wedge ``mkdir`` here.
+    if task.session:
+        target_root = staging / f"ses-{safe_path_component(task.session)}"
+    else:
+        target_root = staging
     target_root.mkdir(parents=True, exist_ok=True)
     try:
         backend = dispatch(backends, task)
@@ -782,7 +807,7 @@ def _write_error_log(
     try:
         err_dir = bids_root / ".bidsmgr" / "errors"
         err_dir.mkdir(parents=True, exist_ok=True)
-        path = err_dir / f"sub-{subject}_{_utc_stamp()}.json"
+        path = err_dir / f"sub-{safe_path_component(subject)}_{_utc_stamp()}.json"
         payload = {
             "schema_version": 1,
             "subject": subject,
