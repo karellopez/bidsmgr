@@ -19,6 +19,7 @@ from bidsmgr.converter.backends.dcm2niix_direct import (
     Dcm2niixDirect,
     _collect_outputs,
     _missing_expected,
+    _safe_dicoms_dirname,
     _stage_dicoms,
 )
 from bidsmgr.converter.types import ConvertTask
@@ -98,6 +99,46 @@ def _fake_dcm2niix(
         return subprocess.CompletedProcess(args=cmd, returncode=returncode, stdout="", stderr=stderr)
 
     return _runner
+
+
+# ---------------------------------------------------------------------------
+# _safe_dicoms_dirname
+# ---------------------------------------------------------------------------
+
+
+class TestSafeDicomsDirname:
+    """The per-series staging dir name must be portable + short.
+
+    Regression for Windows ``WinError 123`` (illegal ``|`` in fmap-pair
+    series_uids) and dcm2niix ``rc=2`` triggered by hitting MAX_PATH
+    with raw UID-named staging dirs on deep BIDS trees.
+    """
+
+    _FORBIDDEN = '<>:"/\\|?*'
+
+    def test_replaces_pipe_with_safe_chars(self) -> None:
+        # fmap pair: two UIDs joined by '|' — the original Windows
+        # crash trigger.
+        joined = (
+            "1.3.12.2.1107.5.2.43.66080.2025052611251937202010812.0.0.0"
+            "|"
+            "1.3.12.2.1107.5.2.43.66080.2025052611251937202710813.0.0.0"
+        )
+        name = _safe_dicoms_dirname(joined)
+        assert "|" not in name
+        assert not any(c in name for c in self._FORBIDDEN)
+
+    def test_dirname_stays_short(self) -> None:
+        # Long UID — must still produce a short dir name.
+        long_uid = "1.3.12.2.1107.5.2.43.66080.2025052611205648833107050.0.0.0"
+        name = _safe_dicoms_dirname(long_uid)
+        assert len(name) <= 24, f"dir name too long: {name!r}"
+
+    def test_deterministic(self) -> None:
+        assert _safe_dicoms_dirname("1.2.3") == _safe_dicoms_dirname("1.2.3")
+
+    def test_unique_per_uid(self) -> None:
+        assert _safe_dicoms_dirname("a") != _safe_dicoms_dirname("b")
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ directly, no wrapper layer.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -117,7 +118,13 @@ class Dcm2niixDirect:
         # Per-series symlink fan-out. Sibling staging dirs (one per
         # series) live alongside the datatype tree so nothing collides
         # when multiple tasks for the same subject run in parallel.
-        dicoms_dir = staging_dir / f"_dicoms_{task.series_uid}"
+        # The dir name is a short hash of ``task.series_uid`` rather
+        # than the UID itself: (a) fmap rows carry a ``|``-joined pair
+        # of UIDs which is an illegal Windows path character, and
+        # (b) a raw UID is ~64 chars (130 for a pair), which pushes
+        # deep Windows BIDS trees past the 260-char ``MAX_PATH`` limit
+        # and trips dcm2niix with ``rc=2``.
+        dicoms_dir = staging_dir / _safe_dicoms_dirname(task.series_uid)
         n_staged = _stage_dicoms(task.source_files, dicoms_dir)
         if n_staged == 0:
             return ConvertResult(
@@ -169,6 +176,26 @@ class Dcm2niixDirect:
 # ---------------------------------------------------------------------------
 # Module-level helpers (picklable for joblib workers; reused by tests)
 # ---------------------------------------------------------------------------
+
+
+def _safe_dicoms_dirname(series_uid: str) -> str:
+    """Return the per-series staging dir name as ``_dicoms_<hash>``.
+
+    The raw ``series_uid`` is unsuitable as a directory component:
+
+    * fmap rows collapse a magnitude/phase pair into one row whose
+      ``series_uid`` is the two UIDs joined by ``|`` — illegal in
+      Windows path components.
+    * A single UID is ~64 chars and a pair ~130; combined with deep
+      Windows BIDS trees this pushes the full staging path past the
+      260-char ``MAX_PATH`` limit and dcm2niix exits ``rc=2``.
+
+    A 12-hex SHA-1 prefix is unique in practice (one subject's batch
+    has on the order of 10² series — collision probability ≈ 2⁻⁴⁰)
+    and keeps the dir at 20 chars including the ``_dicoms_`` prefix.
+    """
+    digest = hashlib.sha1(series_uid.encode("utf-8")).hexdigest()[:12]
+    return f"_dicoms_{digest}"
 
 
 def _stage_dicoms(source_files, staging_dir: Path) -> int:
