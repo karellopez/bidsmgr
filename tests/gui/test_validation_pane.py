@@ -18,9 +18,11 @@ import pytest
 from PyQt6.QtWidgets import QLabel
 
 from bidsmgr.editor.types import (
+    FieldLevel,
     FileVerdict,
     Issue,
     Severity,
+    SidecarField,
     ValidationReport,
 )
 from bidsmgr.gui.editor_panel import EditorPanel
@@ -341,6 +343,175 @@ def test_editor_panel_tree_click_updates_validation_pane(
         and lbl.text().startswith("File")
     ]
     assert file_titles == ["File · sub-01_ses-01_T1w.json"]
+
+
+def test_val_message_renders_field_chip_when_present(
+    qapp, bids_root: Path,
+) -> None:
+    """Issues that name a JSON ``field`` now surface it as a chip
+    (object name ``val-field``) on the ValMessage header — matching
+    the HTML report's ``.field`` span."""
+    pane = ValidationPane()
+    rel = (
+        bids_root / "sub-01" / "ses-01" / "anat" / "sub-01_ses-01_T1w.json"
+    ).relative_to(bids_root)
+    report = ValidationReport(
+        bids_root=bids_root,
+        files=[
+            FileVerdict(
+                path=rel,
+                severity=Severity.WARN,
+                issues=[
+                    Issue(
+                        severity=Severity.WARN,
+                        rule_id="bidsmgr.todo_placeholder",
+                        message="field 'License' contains TODO placeholder",
+                        field="License",
+                    ),
+                    Issue(
+                        severity=Severity.WARN,
+                        rule_id="bidsmgr.layout",
+                        message="(generic layout warning)",
+                        # No field — no chip rendered.
+                    ),
+                ],
+            ),
+        ],
+    )
+    pane.set_report(report)
+    pane.set_current_file(bids_root / rel, bids_root)
+
+    field_chips = [
+        lbl for lbl in pane.findChildren(QLabel)
+        if lbl.objectName() == "val-field"
+    ]
+    # Exactly one chip rendered (for the License issue); the
+    # field-less issue stays chip-free.
+    assert len(field_chips) == 1
+    assert field_chips[0].text() == "License"
+
+
+def test_schema_audit_section_appears_for_json_with_fields(
+    qapp, bids_root: Path,
+) -> None:
+    """When the selected file has ``sidecar_fields``, the pane grows a
+    fourth section that summarises the schema audit."""
+    pane = ValidationPane()
+    rel = (
+        bids_root / "sub-01" / "ses-01" / "anat" / "sub-01_ses-01_T1w.json"
+    ).relative_to(bids_root)
+    report = ValidationReport(
+        bids_root=bids_root,
+        files=[
+            FileVerdict(
+                path=rel,
+                severity=Severity.ERR,
+                datatype="anat", suffix="T1w",
+                sidecar_fields=[
+                    SidecarField(
+                        level=FieldLevel.REQUIRED,
+                        name="MagneticFieldStrength",
+                        value=None, present=False, value_kind="missing",
+                    ),
+                    SidecarField(
+                        level=FieldLevel.REQUIRED,
+                        name="Manufacturer",
+                        value="Siemens", present=True, value_kind="string",
+                    ),
+                    SidecarField(
+                        level=FieldLevel.RECOMMENDED,
+                        name="RepetitionTime",
+                        value=2.0, present=True, value_kind="number",
+                    ),
+                ],
+            ),
+        ],
+    )
+    pane.set_report(report)
+    pane.set_current_file(bids_root / rel, bids_root)
+
+    titles = [
+        lbl.text() for lbl in pane._body.findChildren(QLabel)
+        if lbl.objectName() == "val-section-title"
+    ]
+    assert "Schema audit" in titles
+    # Required-missing rolls the chip up to err.
+    chips = [
+        lbl for lbl in pane._body.findChildren(QLabel)
+        if lbl.objectName() in ("val-count-ok", "val-count-warn", "val-count-err")
+    ]
+    audit_chip = chips[-1]
+    assert audit_chip.objectName() == "val-count-err"
+    assert "missing required" in audit_chip.text()
+    # Missing field name surfaces in the audit body.
+    miss_labels = [
+        lbl.text() for lbl in pane._body.findChildren(QLabel)
+        if lbl.objectName() == "val-audit-missing"
+    ]
+    assert any("MagneticFieldStrength" in t for t in miss_labels)
+
+
+def test_schema_audit_chip_is_ok_when_nothing_missing(
+    qapp, bids_root: Path,
+) -> None:
+    pane = ValidationPane()
+    rel = (
+        bids_root / "sub-01" / "ses-01" / "anat" / "sub-01_ses-01_T1w.json"
+    ).relative_to(bids_root)
+    report = ValidationReport(
+        bids_root=bids_root,
+        files=[
+            FileVerdict(
+                path=rel,
+                severity=Severity.OK,
+                datatype="anat", suffix="T1w",
+                sidecar_fields=[
+                    SidecarField(
+                        level=FieldLevel.REQUIRED,
+                        name="Manufacturer",
+                        value="Siemens", present=True, value_kind="string",
+                    ),
+                ],
+            ),
+        ],
+    )
+    pane.set_report(report)
+    pane.set_current_file(bids_root / rel, bids_root)
+    chips = [
+        lbl for lbl in pane._body.findChildren(QLabel)
+        if lbl.objectName() in ("val-count-ok", "val-count-warn", "val-count-err")
+    ]
+    audit_chip = chips[-1]
+    assert audit_chip.objectName() == "val-count-ok"
+
+
+def test_schema_audit_section_omitted_when_no_fields(
+    qapp, bids_root: Path,
+) -> None:
+    """Files without ``sidecar_fields`` (NIfTI / TSV / non-validated)
+    don't get a Schema audit section."""
+    pane = ValidationPane()
+    nii_rel = (
+        bids_root / "sub-01" / "ses-01" / "anat" / "sub-01_ses-01_T1w.nii.gz"
+    ).relative_to(bids_root)
+    report = ValidationReport(
+        bids_root=bids_root,
+        files=[
+            FileVerdict(
+                path=nii_rel,
+                severity=Severity.OK,
+                datatype="anat", suffix="T1w",
+                # No sidecar_fields.
+            ),
+        ],
+    )
+    pane.set_report(report)
+    pane.set_current_file(bids_root / nii_rel, bids_root)
+    titles = [
+        lbl.text() for lbl in pane._body.findChildren(QLabel)
+        if lbl.objectName() == "val-section-title"
+    ]
+    assert "Schema audit" not in titles
 
 
 def test_root_swap_clears_validation_pane(

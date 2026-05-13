@@ -21,7 +21,7 @@ import html
 from datetime import datetime
 from typing import Iterable
 
-from .types import FileVerdict, Issue, Severity, ValidationReport
+from .types import FieldLevel, FileVerdict, Issue, Severity, ValidationReport
 
 
 # Palette from the Inspector prototype's LIGHT theme (proto.py L67–104).
@@ -259,6 +259,94 @@ footer {
   font-size: 12px;
   text-align: center;
 }
+
+/* All-files section — every file walked by the validator, even the
+   passing ones. Each <details> collapses by default so the report
+   stays scannable; the user can expand individual rows. */
+details.file-all {
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  margin-top: 8px;
+  background: var(--panel);
+}
+details.file-all > summary {
+  cursor: pointer;
+  padding: 8px 12px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  list-style: none;
+}
+details.file-all > summary::-webkit-details-marker { display: none; }
+details.file-all > summary::before {
+  content: '▸';
+  color: var(--muted);
+  font-size: 11px;
+  transition: transform 0.15s;
+}
+details.file-all[open] > summary::before { transform: rotate(90deg); }
+details.file-all > summary code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--fg);
+  background: transparent;
+  padding: 0;
+}
+details.file-all > summary .typed {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+details.file-all > .body {
+  padding: 4px 12px 12px 12px;
+  border-top: 1px solid var(--panel-border);
+}
+
+/* Sidecar fields audit table (only for JSON files). */
+table.sidecar-fields {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: 12px;
+}
+table.sidecar-fields th,
+table.sidecar-fields td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--panel-border);
+  vertical-align: top;
+}
+table.sidecar-fields th {
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+table.sidecar-fields td code {
+  background: var(--code-bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+table.sidecar-fields td.has-desc {
+  cursor: help;
+  text-decoration: underline dotted var(--muted);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+table.sidecar-fields tr.lvl-req td:first-child { color: var(--err-fg); font-weight: 600; }
+table.sidecar-fields tr.lvl-rec td:first-child { color: var(--warn-fg); font-weight: 600; }
+table.sidecar-fields tr.lvl-opt td:first-child { color: var(--muted); }
+table.sidecar-fields tr.lvl-dep td:first-child { color: var(--muted); text-decoration: line-through; }
+table.sidecar-fields tr.missing td.value { color: var(--err-fg); font-style: italic; }
+
+.section-hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 4px 0 12px 0;
+}
 """
 
 
@@ -361,6 +449,27 @@ def render_html(report: ValidationReport) -> str:
         parts.append('<p class="empty">No per-file issues.</p>')
     parts.append("</section>")
 
+    # All files — every file the validator visited, including OK ones.
+    # Each row expands to show its schema-audit table (for JSON files)
+    # so the user can inspect the full validator output without
+    # opening the raw JSON report.
+    parts.append('<section id="files-all">')
+    parts.append("<h2>All files</h2>")
+    if report.files:
+        parts.append(
+            '<p class="section-hint">Every file walked by the validator. '
+            f"{len(report.files)} total. Click a row to expand its "
+            "schema audit (JSON sidecars only).</p>"
+        )
+        files_sorted = sorted(
+            report.files, key=lambda f: (str(f.path.parent), f.path.name),
+        )
+        for f in files_sorted:
+            parts.append(_render_file_all(f))
+    else:
+        parts.append('<p class="empty">No files were walked.</p>')
+    parts.append("</section>")
+
     # Footer
     parts.append("<footer>")
     parts.append(
@@ -425,6 +534,112 @@ def _render_file(f: FileVerdict) -> str:
     parts.append("</h3>")
     parts.append(_render_issue_list(f.issues))
     parts.append("</div>")
+    return "".join(parts)
+
+
+def _render_file_all(f: FileVerdict) -> str:
+    """Render one entry of the "All files" section.
+
+    Always shows the path + severity badge + datatype/suffix as a
+    collapsible ``<details>`` summary. For JSON sidecars the body
+    expands to a full schema-audit table (every required /
+    recommended / optional / deprecated field). For non-JSON files
+    the body is omitted — there's nothing to audit beyond what's in
+    the issues list (which has its own dedicated section above).
+    """
+    sev = f.severity.value
+    parts: list[str] = [f'<details class="file-all" data-severity="{sev}">']
+    parts.append("<summary>")
+    parts.append(f'<span class="badge {sev}">{sev}</span>')
+    parts.append(f"<code>{html.escape(str(f.path))}</code>")
+    if f.datatype or f.suffix:
+        typed = "/".join(filter(None, [f.datatype, f.suffix]))
+        parts.append(f'<span class="typed">{html.escape(typed)}</span>')
+    parts.append("</summary>")
+    parts.append('<div class="body">')
+    if f.issues:
+        parts.append("<h4>Issues</h4>")
+        parts.append(_render_issue_list(f.issues))
+    if f.sidecar_fields:
+        parts.append("<h4>Schema audit</h4>")
+        parts.append(_render_sidecar_fields_table(f.sidecar_fields))
+    if not f.issues and not f.sidecar_fields:
+        parts.append(
+            '<p class="section-hint">No findings and no schema audit '
+            "(non-JSON file).</p>"
+        )
+    parts.append("</div>")
+    parts.append("</details>")
+    return "".join(parts)
+
+
+_LEVEL_CSS_CLASS: dict[FieldLevel, str] = {
+    FieldLevel.REQUIRED: "lvl-req",
+    FieldLevel.RECOMMENDED: "lvl-rec",
+    FieldLevel.OPTIONAL: "lvl-opt",
+    FieldLevel.DEPRECATED: "lvl-dep",
+}
+
+
+def _render_sidecar_fields_table(fields) -> str:
+    """Render a SidecarField list as a 4-column audit table.
+
+    Columns: Level / Field / Value / Present. Fields are sorted by
+    level (required first) and then by name within each level. The
+    schema's ``description`` (when present) is exposed as a hover
+    tooltip on the Field cell — including it as its own column made
+    rows too wide for typical sidecar audits.
+    """
+    parts: list[str] = ['<table class="sidecar-fields">']
+    parts.append("<thead><tr>")
+    parts.append("<th>Level</th>")
+    parts.append("<th>Field</th>")
+    parts.append("<th>Value</th>")
+    parts.append("<th>Present</th>")
+    parts.append("</tr></thead>")
+    parts.append("<tbody>")
+    # Stable level order: required → recommended → optional → deprecated.
+    level_rank = {
+        FieldLevel.REQUIRED: 0,
+        FieldLevel.RECOMMENDED: 1,
+        FieldLevel.OPTIONAL: 2,
+        FieldLevel.DEPRECATED: 3,
+    }
+    rows = sorted(
+        fields,
+        key=lambda f: (level_rank.get(f.level, 9), f.name.lower()),
+    )
+    for fld in rows:
+        css = _LEVEL_CSS_CLASS.get(fld.level, "lvl-opt")
+        miss_class = " missing" if not fld.present else ""
+        if fld.value is None:
+            value_html = (
+                '<em>(missing)</em>' if not fld.present else "<code>null</code>"
+            )
+        else:
+            value_html = f"<code>{html.escape(str(fld.value))}</code>"
+        present = "✓" if fld.present else "—"
+        # The ``description`` (schema doc string) lands as a ``title``
+        # attribute on the Field cell — hover to read. The ``has-desc``
+        # class lets CSS show a small visual hint that hovering will
+        # reveal more.
+        name_html = f"<code>{html.escape(fld.name)}</code>"
+        if fld.description:
+            field_cell = (
+                f'<td class="has-desc" title="{html.escape(fld.description)}">'
+                f"{name_html}</td>"
+            )
+        else:
+            field_cell = f"<td>{name_html}</td>"
+        parts.append(
+            f'<tr class="{css}{miss_class}">'
+            f"<td>{fld.level.value}</td>"
+            f"{field_cell}"
+            f'<td class="value">{value_html}</td>'
+            f"<td>{present}</td>"
+            "</tr>"
+        )
+    parts.append("</tbody></table>")
     return "".join(parts)
 
 

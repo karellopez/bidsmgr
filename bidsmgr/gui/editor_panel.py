@@ -21,7 +21,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -34,8 +34,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..editor.types import Severity, ValidationReport
-from ..workers import ReportWorker
+from ..editor.types import FileVerdict, Severity, ValidationReport
+from ..workers import FileReportWorker, FolderReportWorker, ReportWorker
 from .widgets import (
     BidsTreePane,
     BusySpinner,
@@ -67,6 +67,10 @@ class EditorPanel(QWidget):
 
         self._report: Optional[ValidationReport] = None
         self._report_worker: Optional[ReportWorker] = None
+        # Partial-validate workers (toolbar's Validate file / folder
+        # buttons). Kept on self so they're not garbage-collected
+        # mid-flight.
+        self._partial_worker: Optional[QObject] = None
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -85,6 +89,11 @@ class EditorPanel(QWidget):
 
         self._tree_pane = BidsTreePane()
         self._tree_pane.file_selected.connect(self._on_file_selected)
+        # Drive the Validate file/folder button enable-state from the
+        # tree selection — file → file button, folder → folder button.
+        self._tree_pane.file_selected.connect(
+            self._sync_validate_buttons_from_selection
+        )
         # Center pane is itself a stack — different viewer per file
         # kind. Index 0 = JSON sidecar (default for unsupported kinds
         # too — its empty-state hint guides the user to the JSON peer).
@@ -95,6 +104,7 @@ class EditorPanel(QWidget):
         self._center_stack.addWidget(self._sidecar_form)
         self._center_stack.addWidget(self._tsv_viewer)
         self._validation_pane = ValidationPane()
+        self._validation_pane.fix_requested.connect(self._on_fix_requested)
         self._splitter.addWidget(self._tree_pane)
         self._splitter.addWidget(self._center_stack)
         self._splitter.addWidget(self._validation_pane)
@@ -147,6 +157,48 @@ class EditorPanel(QWidget):
         self._report_worker = worker
         worker.start()
 
+    def start_file_validation(self) -> None:
+        """Re-validate the currently-selected file (layer 1 only)."""
+        root = self.current_root()
+        if root is None:
+            return
+        target = self._tree_pane_current_path()
+        if target is None or not target.is_file():
+            return
+        if self._partial_worker is not None and getattr(
+            self._partial_worker, "isRunning", lambda: False,
+        )():
+            return
+        self._set_busy(True, f"Validating {target.name}…")
+        worker = FileReportWorker(root, target, parent=self)
+        self._wire_partial_worker(worker)
+        self._partial_worker = worker
+        worker.start()
+
+    def start_folder_validation(self) -> None:
+        """Re-validate the currently-selected folder (layer 1 only)."""
+        root = self.current_root()
+        if root is None:
+            return
+        target = self._tree_pane_current_path()
+        if target is None or not target.is_dir():
+            return
+        if self._partial_worker is not None and getattr(
+            self._partial_worker, "isRunning", lambda: False,
+        )():
+            return
+        self._set_busy(True, f"Validating {target.name}/…")
+        worker = FolderReportWorker(root, target, parent=self)
+        self._wire_partial_worker(worker)
+        self._partial_worker = worker
+        worker.start()
+
+    def _wire_partial_worker(self, worker) -> None:
+        worker.progress.connect(self._on_progress)
+        worker.finished_with_verdicts.connect(self._on_partial_ready)
+        worker.failed.connect(self._on_worker_failed)
+        worker.finished.connect(self._on_partial_worker_finished)
+
     # ------------------------------------------------------------------
     # Toolbar / panes
     # ------------------------------------------------------------------
@@ -166,16 +218,29 @@ class EditorPanel(QWidget):
 
         lay.addWidget(VSep())
 
-        # File / folder validation arrive in Step 6; keep them visible
-        # so the toolbar shape matches the proto.
+        # Validate file / folder reuse the dataset report — but run
+        # only layer 1 (per-file checks). Layer 2 is dataset-wide and
+        # is reserved for the dataset-level button.
         self._validate_file_btn = QPushButton("✓  Validate file")
         self._validate_file_btn.setObjectName("tb-btn")
         self._validate_file_btn.setEnabled(False)
+        self._validate_file_btn.setToolTip(
+            "Re-validate the file currently selected in the BIDS "
+            "tree. Updates only that file's badge + Validation pane "
+            "section; the dataset-wide report stays intact."
+        )
+        self._validate_file_btn.clicked.connect(self.start_file_validation)
         lay.addWidget(self._validate_file_btn)
 
         self._validate_folder_btn = QPushButton("📂  Validate folder")
         self._validate_folder_btn.setObjectName("tb-btn")
         self._validate_folder_btn.setEnabled(False)
+        self._validate_folder_btn.setToolTip(
+            "Re-validate every file under the folder currently "
+            "selected in the BIDS tree. Skips folder/dataset-level "
+            "checks — use “Validate dataset” for the full pass."
+        )
+        self._validate_folder_btn.clicked.connect(self.start_folder_validation)
         lay.addWidget(self._validate_folder_btn)
 
         self._validate_dataset_btn = QPushButton("🗂  Validate dataset")
@@ -212,12 +277,22 @@ class EditorPanel(QWidget):
 
         lay.addWidget(VSep())
 
-        # Status chips — kept hidden until a report lands.
+        # Status chips — kept hidden until a report lands. Each chip
+        # opens the file-issues dialog filtered by the matching
+        # severity (same "jump to" pattern as the Converter's toolbar).
         self._chip_ok = Chip("✓ 0 valid", "success")
         self._chip_warn = Chip("⚠ 0 warnings", "warn")
         self._chip_err = Chip("✕ 0 errors", "err")
-        for chip in (self._chip_ok, self._chip_warn, self._chip_err):
+        for chip, sev in (
+            (self._chip_ok, "ok"),
+            (self._chip_warn, "warn"),
+            (self._chip_err, "err"),
+        ):
             chip.setVisible(False)
+            chip.set_clickable(True)
+            chip.clicked.connect(
+                lambda s=sev: self._open_issues_dialog(s)
+            )
             lay.addWidget(chip)
 
         lay.addStretch(1)
@@ -308,6 +383,109 @@ class EditorPanel(QWidget):
         self._validate_dataset_btn.setEnabled(self.current_root() is not None)
         self._report_worker = None
 
+    def _on_partial_ready(
+        self,
+        verdicts: list[FileVerdict],
+        bids_root: Path,
+        target_path: Path,
+    ) -> None:
+        """Merge per-file or per-folder verdicts into the in-memory report.
+
+        Existing FileVerdicts for the same paths are replaced; new ones
+        append. Dataset / folder issues stay untouched (they belong to
+        the dataset-wide pass).
+        """
+        del bids_root  # we already cache it as self._current_root
+        if not verdicts:
+            return
+        # Ensure we have a report to merge into.
+        if self._report is None:
+            self._report = ValidationReport(bids_root=self.current_root())
+        existing_by_path = {fv.path: i for i, fv in enumerate(self._report.files)}
+        for fv in verdicts:
+            if fv.path in existing_by_path:
+                self._report.files[existing_by_path[fv.path]] = fv
+            else:
+                existing_by_path[fv.path] = len(self._report.files)
+                self._report.files.append(fv)
+        # Re-rollup severity + counts (cheap to recompute).
+        self._recompute_report_summary(self._report)
+        # Refresh the UI.
+        self._stamp_tree_badges(self._report)
+        self._update_chips(self._report)
+        self._validation_pane.set_report(self._report)
+        self._validation_pane.set_current_file(
+            self._sidecar_form.current_file(), self.current_root(),
+        )
+        # Sidecar pane re-binds against the now-fresh verdict.
+        current = self._sidecar_form.current_file()
+        if current is not None:
+            self._sidecar_form.set_file(
+                current, self.current_root(), self._report,
+            )
+        self.log_message.emit(
+            f"Validation done — {len(verdicts)} file"
+            f"{'s' if len(verdicts) != 1 else ''} re-checked"
+        )
+        del target_path
+
+    def _on_partial_worker_finished(self) -> None:
+        self._set_busy(False)
+        self._partial_worker = None
+        self._sync_validate_buttons_from_selection(
+            self._tree_pane_current_path(),
+        )
+
+    def _tree_pane_current_path(self) -> Optional[Path]:
+        """Return the absolute path of the BIDS tree's current selection."""
+        from .widgets.bids_tree_pane import PATH_ROLE
+        item = self._tree_pane._tree.currentItem()
+        if item is None:
+            return None
+        raw = item.data(0, PATH_ROLE)
+        return Path(raw) if raw else None
+
+    def _sync_validate_buttons_from_selection(
+        self, path: Optional[Path],
+    ) -> None:
+        """Enable Validate file when a file is selected, Validate
+        folder when a folder is selected.
+
+        Both stay disabled until a BIDS root is open. A partial-validate
+        already in flight also disables them (debounce).
+        """
+        has_root = self.current_root() is not None
+        running = self._partial_worker is not None and getattr(
+            self._partial_worker, "isRunning", lambda: False,
+        )()
+        if path is None or not has_root or running:
+            self._validate_file_btn.setEnabled(False)
+            self._validate_folder_btn.setEnabled(False)
+            return
+        self._validate_file_btn.setEnabled(path.is_file())
+        self._validate_folder_btn.setEnabled(path.is_dir())
+
+    @staticmethod
+    def _recompute_report_summary(report: ValidationReport) -> None:
+        """Reset ``severity`` and ``counts`` after files were mutated."""
+        severities = []
+        for f in report.files:
+            severities.append(f.severity)
+        for issues in report.folder_issues.values():
+            severities.extend(i.severity for i in issues)
+        severities.extend(i.severity for i in report.dataset_issues)
+        counts = {"ok": 0, "warn": 0, "err": 0}
+        for sev in severities:
+            val = sev.value if isinstance(sev, Severity) else str(sev)
+            counts[val] = counts.get(val, 0) + 1
+        report.counts = counts
+        if any(s is Severity.ERR for s in severities):
+            report.severity = Severity.ERR
+        elif any(s is Severity.WARN for s in severities):
+            report.severity = Severity.WARN
+        else:
+            report.severity = Severity.OK
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -391,6 +569,68 @@ class EditorPanel(QWidget):
 
     # ------------------------------------------------------------------
     # Theme cascade (called by MainWindow._on_palette_changed)
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Jump-to-file + jump-to-field interactivity
+    # ------------------------------------------------------------------
+
+    def _open_issues_dialog(self, severity: str) -> None:
+        """Open a modal :class:`EditorIssuesDialog` filtered by severity.
+
+        The dialog lists every file in the current report whose
+        severity matches. Activating a card selects the file in the
+        BIDS tree (which cascades through the panes).
+        """
+        if self._report is None or self.current_root() is None:
+            return
+        from .editor_issues_dialog import EditorIssuesDialog
+        dlg = EditorIssuesDialog(
+            self._report, severity, self.current_root(), parent=self,
+        )
+        dlg.file_selected.connect(self.select_file_in_tree)
+        dlg.show()
+
+    def select_file_in_tree(self, path: Path) -> None:
+        """Select ``path`` in the BIDS tree (cascades to all panes).
+
+        Public so other widgets (the issues dialog, the validation
+        pane's fix-button handler) can use it.
+        """
+        target = str(path)
+        tree = self._tree_pane._tree
+
+        def visit(item) -> bool:
+            from .widgets.bids_tree_pane import PATH_ROLE
+            stored = item.data(0, PATH_ROLE)
+            if stored == target:
+                tree.setCurrentItem(item)
+                tree.scrollToItem(item)
+                return True
+            for i in range(item.childCount()):
+                if visit(item.child(i)):
+                    return True
+            return False
+
+        for i in range(tree.topLevelItemCount()):
+            if visit(tree.topLevelItem(i)):
+                return
+        # If the tree row can't be found (e.g. the file got renamed
+        # between validation and the click), fall back to loading
+        # the sidecar / TSV viewer directly so the click still works.
+        self._on_file_selected(path)
+
+    def _on_fix_requested(self, path: Path, field: str) -> None:
+        """A user clicked a ValMessage's fix button.
+
+        First land on the file (if it isn't already the bound one),
+        then ask the sidecar pane to focus the named field.
+        """
+        if path is not None and path != self._sidecar_form.current_file():
+            self.select_file_in_tree(path)
+        if field:
+            self._sidecar_form.focus_field(field)
+
     # ------------------------------------------------------------------
 
     def repaint_for_palette(self, pal: dict) -> None:

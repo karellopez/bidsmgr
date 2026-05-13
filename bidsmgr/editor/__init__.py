@@ -23,10 +23,11 @@ from .types import (
     ValidationReport,
     rollup_severity,
 )
-from .validator import validate
+from .validator import validate, validate_file, validate_folder
 
 __all__ = [
     "FieldLevel", "FileVerdict", "Issue", "Severity",
     "SidecarField", "ValidationReport",
-    "render_html", "rollup_severity", "validate",
+    "render_html", "rollup_severity",
+    "validate", "validate_file", "validate_folder",
 ]

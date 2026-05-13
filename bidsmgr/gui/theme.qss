@@ -640,6 +640,17 @@ QLabel#val-section-title {
     letter-spacing: 1px;
     text-transform: uppercase;
 }
+/* Schema-audit rows inside the Validation pane. */
+QLabel#val-audit-summary {
+    color: $text;
+    font-size: 11px;
+}
+QLabel#val-audit-missing {
+    color: $error;
+    font-size: 10px;
+    font-family: "SF Mono","Menlo","Monaco",monospace;
+}
+
 QLabel#val-count-ok   { background: $surface3; color: $dim; padding: 1px 6px; border-radius: 8px; font-size: 9px; }
 QLabel#val-count-warn { background: $warning_bg; color: $warning; padding: 1px 6px; border-radius: 8px; font-size: 9px; }
 QLabel#val-count-err  { background: $error_bg; color: $error; padding: 1px 6px; border-radius: 8px; font-size: 9px; }
@@ -674,6 +685,17 @@ QLabel#val-rule {
     color: $muted;
     text-transform: uppercase;
     letter-spacing: 0.04em;
+}
+/* Optional small chip on the header row, naming the JSON field a
+   finding refers to (e.g. "License" for a TODO-placeholder issue). */
+QLabel#val-field {
+    font-family: "SF Mono","Menlo","Monaco",monospace;
+    font-size: 9px;
+    color: $accent;
+    background: $accent_bg;
+    border: 1px solid $accent_border;
+    border-radius: 8px;
+    padding: 1px 6px;
 }
 QLabel#val-body  { color: $text; font-size: 11px; }
 QPushButton#val-fix {

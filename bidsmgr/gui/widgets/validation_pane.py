@@ -35,7 +35,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -46,9 +46,11 @@ from PyQt6.QtWidgets import (
 )
 
 from ...editor.types import (
+    FieldLevel,
     FileVerdict,
     Issue,
     Severity,
+    SidecarField,
     ValidationReport,
 )
 from .primitives import PaneHeader
@@ -119,7 +121,15 @@ def _folder_key_for(root: Optional[Path], path: Optional[Path]) -> Optional[str]
 
 
 class ValidationPane(QWidget):
-    """Read-only validation summary (Editor right pane)."""
+    """Read-only validation summary (Editor right pane).
+
+    Emits :pyattr:`fix_requested` with ``(file_path, field_name)`` when
+    the user clicks a ValMessage's fix button. For dataset / folder
+    issues the file path is the currently-bound file (if any); for
+    file issues it's the file the section is showing.
+    """
+
+    fix_requested = pyqtSignal(object, str)  # (Path | None, field_name)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -220,10 +230,14 @@ class ValidationPane(QWidget):
             return
 
         # Section 1: dataset issues.
+        # Fix buttons on dataset issues land on the currently-selected
+        # file if any (matches what the user expects when they're
+        # already viewing ``dataset_description.json``).
         self._insert_section(
             "Dataset",
             self._report.dataset_issues,
             empty_text="No dataset-level issues.",
+            target_file=self._current_file,
         )
 
         # Section 2: folder issues (parent of current file).
@@ -244,6 +258,7 @@ class ValidationPane(QWidget):
                 if self._current_file is not None
                 else "Select a file to see folder-level findings."
             ),
+            target_file=self._current_file,
         )
 
         # Section 3: file issues (FileVerdict for current file).
@@ -268,7 +283,15 @@ class ValidationPane(QWidget):
             file_label,
             file_issues,
             empty_text=empty_text,
+            target_file=self._current_file,
         )
+
+        # Section 4: schema audit (only when the current file has one).
+        # The JSON validation_report carries every SidecarField — that's
+        # info the form pane uses but the user can't easily eyeball.
+        # Surface a compact summary here.
+        if verdict is not None and verdict.sidecar_fields:
+            self._insert_schema_audit_section(verdict)
 
     def _insert_section(
         self,
@@ -276,6 +299,7 @@ class ValidationPane(QWidget):
         issues: list[Issue],
         *,
         empty_text: str,
+        target_file: Optional[Path] = None,
     ) -> None:
         section = QFrame()
         section.setObjectName("val-section")
@@ -313,6 +337,13 @@ class ValidationPane(QWidget):
                     rule=issue.rule_id,
                     body_html=issue.message,
                     fix_label=issue.fix_label,
+                    field=issue.field,
+                )
+                # Re-emit fix clicks with the file context so the host
+                # panel can jump to the right place.
+                msg.fix_requested.connect(
+                    lambda field, p=target_file:
+                        self.fix_requested.emit(p, field)
                 )
                 sl.addWidget(msg)
 
@@ -323,6 +354,97 @@ class ValidationPane(QWidget):
         insert_idx = self._body_layout.count() - 1
         self._body_layout.insertWidget(insert_idx, widget)
         self._section_widgets.append(widget)
+
+    def _insert_schema_audit_section(
+        self, verdict: FileVerdict,
+    ) -> None:
+        """Render a compact schema-audit summary for the current file.
+
+        Counts per level + the names of any missing required /
+        recommended fields. Optional / deprecated counts are shown but
+        their member lists are folded — they're noise for daily review.
+        """
+        section = QFrame()
+        section.setObjectName("val-section")
+        sl = QVBoxLayout(section)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(6)
+
+        # Header row.
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        head.setContentsMargins(0, 0, 0, 0)
+        title_l = QLabel("Schema audit")
+        title_l.setObjectName("val-section-title")
+        head.addWidget(title_l)
+        head.addStretch(1)
+
+        # Per-level breakdown.
+        by_level: dict[FieldLevel, list[SidecarField]] = {
+            FieldLevel.REQUIRED:    [],
+            FieldLevel.RECOMMENDED: [],
+            FieldLevel.OPTIONAL:    [],
+            FieldLevel.DEPRECATED:  [],
+        }
+        for f in verdict.sidecar_fields:
+            by_level.setdefault(f.level, []).append(f)
+        missing_req = [f for f in by_level[FieldLevel.REQUIRED] if not f.present]
+        missing_rec = [f for f in by_level[FieldLevel.RECOMMENDED] if not f.present]
+
+        # Header chip — severity reflects the worst missing level.
+        total_fields = sum(len(v) for v in by_level.values())
+        if missing_req:
+            chip_obj = "val-count-err"
+            chip_text = f"{len(missing_req)} missing required"
+        elif missing_rec:
+            chip_obj = "val-count-warn"
+            chip_text = f"{len(missing_rec)} missing recommended"
+        else:
+            chip_obj = "val-count-ok"
+            chip_text = f"{total_fields} fields"
+        chip = QLabel(chip_text)
+        chip.setObjectName(chip_obj)
+        head.addWidget(chip)
+        sl.addLayout(head)
+
+        # Per-level lines.
+        for level, fields in by_level.items():
+            if not fields:
+                continue
+            present = sum(1 for f in fields if f.present)
+            row = self._build_audit_row(level, fields, present)
+            sl.addWidget(row)
+
+        self._insert_section_widget(section)
+
+    def _build_audit_row(
+        self,
+        level: FieldLevel,
+        fields: list[SidecarField],
+        present: int,
+    ) -> QFrame:
+        row = QFrame()
+        row.setObjectName("val-audit-row")
+        rl = QVBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(2)
+        total = len(fields)
+        missing = [f for f in fields if not f.present]
+        summary = QLabel(
+            f"{level.value.capitalize()}: {present}/{total} present"
+        )
+        summary.setObjectName("val-audit-summary")
+        rl.addWidget(summary)
+        # Only required / recommended get a missing-list expanded inline
+        # — optional / deprecated are noisy. Long lists are truncated.
+        if missing and level in (FieldLevel.REQUIRED, FieldLevel.RECOMMENDED):
+            names = ", ".join(f.name for f in missing[:8])
+            extra = "" if len(missing) <= 8 else f", … (+{len(missing) - 8})"
+            miss_lbl = QLabel(f"missing: {names}{extra}")
+            miss_lbl.setObjectName("val-audit-missing")
+            miss_lbl.setWordWrap(True)
+            rl.addWidget(miss_lbl)
+        return row
 
 
 __all__ = ["ValidationPane"]

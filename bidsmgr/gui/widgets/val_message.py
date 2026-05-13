@@ -40,7 +40,11 @@ class ValMessage(QFrame):
     a fix label + opaque token; the controller decides how to apply).
     """
 
-    fix_requested = pyqtSignal()
+    # Emitted on fix-button click. Carries the issue's ``field`` (the
+    # JSON key the finding refers to) so the host panel can focus that
+    # row in the sidecar form; empty string when the issue has no
+    # specific field.
+    fix_requested = pyqtSignal(str)
 
     def __init__(
         self,
@@ -48,6 +52,7 @@ class ValMessage(QFrame):
         rule: str,
         body_html: str,
         fix_label: Optional[str] = None,
+        field: Optional[str] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -62,9 +67,21 @@ class ValMessage(QFrame):
         right = QVBoxLayout()
         right.setSpacing(4)
 
+        # Header row: rule label + optional field chip on the right.
+        head = QHBoxLayout()
+        head.setSpacing(8)
         rule_l = QLabel(rule)
         rule_l.setObjectName("val-rule")
-        right.addWidget(rule_l)
+        head.addWidget(rule_l)
+        head.addStretch(1)
+        if field:
+            field_chip = QLabel(field)
+            field_chip.setObjectName("val-field")
+            field_chip.setToolTip(
+                "JSON field this finding refers to."
+            )
+            head.addWidget(field_chip, 0, Qt.AlignmentFlag.AlignTop)
+        right.addLayout(head)
 
         body_widget = QHBoxLayout()
         body_widget.setSpacing(8)
@@ -75,10 +92,13 @@ class ValMessage(QFrame):
         body_l.setTextFormat(Qt.TextFormat.RichText)
         body_widget.addWidget(body_l, 1)
 
+        self._field_name = field or ""
         if fix_label:
             btn = QPushButton(fix_label)
             btn.setObjectName("val-fix")
-            btn.clicked.connect(self.fix_requested.emit)
+            btn.clicked.connect(
+                lambda: self.fix_requested.emit(self._field_name)
+            )
             body_widget.addWidget(btn, 0, Qt.AlignmentFlag.AlignTop)
 
         right.addLayout(body_widget)

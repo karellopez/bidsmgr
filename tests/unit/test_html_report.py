@@ -149,16 +149,23 @@ class TestIssueRendering:
         assert "func/bold" in out  # the typed annotation
         assert "TaskDescription" in out
 
-    def test_file_with_no_issues_is_omitted(self) -> None:
-        """We only show flagged files in the report."""
+    def test_file_with_no_issues_omitted_from_flagged_section(self) -> None:
+        """The "Files with issues" section only shows flagged files.
+
+        OK files now appear in the separate "All files" section
+        (added so the HTML carries the same data as the JSON dump).
+        """
         report = _empty_report()
         report.files = [
             FileVerdict(path=Path("sub-001/anat/sub-001_T1w.json"),
                         severity=Severity.OK, datatype="anat", suffix="T1w"),
         ]
         out = render_html(report)
-        assert "sub-001_T1w.json" not in out
+        # The "Files with issues" headline still notes that none have issues.
         assert "No per-file issues" in out
+        # But the file IS listed in the All files section.
+        assert "All files" in out
+        assert "sub-001_T1w.json" in out
 
     def test_color_classes_for_each_severity(self) -> None:
         """Each severity uses the agreed CSS class for color coding."""
@@ -261,4 +268,170 @@ class TestRenderingSize:
         out = render_html(report)
         # Rough size check — should be under a reasonable upper bound.
         assert len(out) < 5_000_000  # 5 MB ceiling for 500 issues
+        # 100 files in "Files with issues" + 100 in "All files" = 200.
         assert out.count('<div class="file') == 100
+        assert out.count('<details class="file-all"') == 100
+
+
+# ---------------------------------------------------------------------------
+# "All files" + schema-audit table
+# ---------------------------------------------------------------------------
+
+
+class TestAllFilesSection:
+    def test_lists_every_file_including_ok_ones(self) -> None:
+        """The All files section enumerates each FileVerdict, even
+        those that passed (Severity.OK with no issues)."""
+        report = _empty_report()
+        report.files = [
+            FileVerdict(
+                path=Path("sub-001/anat/sub-001_T1w.json"),
+                severity=Severity.OK,
+                datatype="anat", suffix="T1w",
+            ),
+            FileVerdict(
+                path=Path("sub-001/anat/sub-001_T1w.nii.gz"),
+                severity=Severity.OK,
+                datatype="anat", suffix="T1w",
+            ),
+        ]
+        out = render_html(report)
+        assert "All files" in out
+        # Two collapsible <details> rows in the All files section.
+        assert out.count('<details class="file-all"') == 2
+        assert "sub-001_T1w.json" in out
+        assert "sub-001_T1w.nii.gz" in out
+
+    def test_section_summary_mentions_total_count(self) -> None:
+        report = _empty_report()
+        report.files = [
+            FileVerdict(
+                path=Path(f"sub-001/anat/file{i}.json"),
+                severity=Severity.OK,
+            )
+            for i in range(5)
+        ]
+        out = render_html(report)
+        assert "5 total" in out
+
+    def test_empty_report_omits_all_files_rows_but_keeps_section(self) -> None:
+        out = render_html(_empty_report())
+        assert "All files" in out
+        # No file rows because there are no files.
+        assert '<details class="file-all"' not in out
+
+
+class TestSchemaAuditTable:
+    def test_renders_sidecar_fields_table_for_json_with_audit(self) -> None:
+        """JSON files with sidecar_fields get a schema-audit table
+        inside their expandable body."""
+        report = _empty_report()
+        report.files = [
+            FileVerdict(
+                path=Path("sub-001/anat/sub-001_T1w.json"),
+                severity=Severity.WARN,
+                datatype="anat", suffix="T1w",
+                sidecar_fields=[
+                    SidecarField(
+                        level=FieldLevel.REQUIRED,
+                        name="MagneticFieldStrength",
+                        value=None,
+                        present=False,
+                        value_kind="missing",
+                    ),
+                    SidecarField(
+                        level=FieldLevel.RECOMMENDED,
+                        name="RepetitionTime",
+                        value=2.0,
+                        present=True,
+                        value_kind="number",
+                    ),
+                ],
+            ),
+        ]
+        out = render_html(report)
+        assert '<table class="sidecar-fields"' in out
+        # Required-level row carries the lvl-req CSS class.
+        assert "lvl-req" in out
+        # Missing required field shows the "(missing)" marker.
+        assert "(missing)" in out
+        # Field names and values appear in the HTML.
+        assert "MagneticFieldStrength" in out
+        assert "RepetitionTime" in out
+
+    def test_non_json_file_has_no_audit_table(self) -> None:
+        """A NIfTI file (no sidecar_fields) has no audit table — the
+        body shows a hint instead."""
+        report = _empty_report()
+        report.files = [
+            FileVerdict(
+                path=Path("sub-001/anat/sub-001_T1w.nii.gz"),
+                severity=Severity.OK,
+                datatype="anat", suffix="T1w",
+            ),
+        ]
+        out = render_html(report)
+        assert '<table class="sidecar-fields"' not in out
+        # Friendly hint instead.
+        assert "non-JSON file" in out
+
+    def test_field_description_lands_as_hover_tooltip(self) -> None:
+        """Schema field descriptions render as ``title`` attributes on
+        the Field cell — hover reveals the docstring without bloating
+        the table to a five-column layout."""
+        report = _empty_report()
+        report.files = [
+            FileVerdict(
+                path=Path("x.json"),
+                sidecar_fields=[
+                    SidecarField(
+                        level=FieldLevel.REQUIRED,
+                        name="RepetitionTime",
+                        value=2.0, present=True,
+                        value_kind="number",
+                        description="The time, in seconds, between two volumes.",
+                    ),
+                    SidecarField(
+                        level=FieldLevel.OPTIONAL,
+                        name="NoDocs",
+                        value="x", present=True, value_kind="string",
+                        # No description.
+                    ),
+                ],
+            ),
+        ]
+        out = render_html(report)
+        # Cell with a description carries title + has-desc class.
+        assert 'class="has-desc"' in out
+        assert (
+            'title="The time, in seconds, between two volumes."' in out
+        )
+        # The cell without a description doesn't.
+        # (We don't pin a precise byte sequence — just that the
+        # description-less field still renders.)
+        assert "NoDocs" in out
+
+    def test_levels_sorted_required_first(self) -> None:
+        """The schema-audit table puts required fields first regardless
+        of disk order."""
+        report = _empty_report()
+        report.files = [
+            FileVerdict(
+                path=Path("x.json"),
+                sidecar_fields=[
+                    SidecarField(
+                        level=FieldLevel.OPTIONAL,
+                        name="zzz_opt", value="x", present=True,
+                        value_kind="string",
+                    ),
+                    SidecarField(
+                        level=FieldLevel.REQUIRED,
+                        name="zzz_req", value="y", present=True,
+                        value_kind="string",
+                    ),
+                ],
+            ),
+        ]
+        out = render_html(report)
+        # zzz_req appears before zzz_opt in the document.
+        assert out.index("zzz_req") < out.index("zzz_opt")

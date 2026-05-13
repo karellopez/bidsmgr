@@ -712,6 +712,67 @@ class SidecarFormPane(QWidget):
     # View-mode toggle + tree handlers
     # ----------------------------------------------------------------------
 
+    def focus_field(self, name: str) -> bool:
+        """Scroll to and focus the editor for the field named ``name``.
+
+        Works in both views — the BIDS form jumps to and focuses the
+        matching :class:`SidecarRow`; the Tree view selects the
+        matching top-level row and begins editing its Value cell.
+        Returns ``True`` if a matching field was found.
+        """
+        if not name or self._json_cache is None:
+            return False
+        if self._view_mode == "tree":
+            return self._focus_field_in_tree(name)
+        return self._focus_field_in_form(name)
+
+    def _focus_field_in_form(self, name: str) -> bool:
+        for row in self._rows:
+            if row.key == name:
+                # Scroll the row into view inside the QScrollArea
+                # parent. ``ensureWidgetVisible`` walks up to find the
+                # nearest scroll area for us.
+                editor = row.editor()
+                if editor is not None:
+                    self._scroll_widget_visible(editor)
+                    editor.setFocus(Qt.FocusReason.OtherFocusReason)
+                    # ``QLineEdit`` highlights its content on focus
+                    # when ``setFocus`` is called this way — gives the
+                    # user a clear visual cue + lets them type to
+                    # overwrite.
+                    if hasattr(editor, "selectAll"):
+                        editor.selectAll()
+                else:
+                    # Read-only mode: still scroll so the user sees it.
+                    self._scroll_widget_visible(row)
+                return True
+        return False
+
+    def _focus_field_in_tree(self, name: str) -> bool:
+        for i in range(self._tree_view.topLevelItemCount()):
+            item = self._tree_view.topLevelItem(i)
+            if item.text(0) == name:
+                self._tree_view.setCurrentItem(item)
+                self._tree_view.scrollToItem(item)
+                # Start editing the Value cell so the user can type
+                # immediately.
+                self._tree_view.editItem(item, 1)
+                return True
+        return False
+
+    def _scroll_widget_visible(self, widget) -> None:
+        """Find the enclosing :class:`QScrollArea` and ensure ``widget``
+        is visible. Walks up the parent chain (the QStackedWidget
+        layout puts the scroll area a couple of levels above the row).
+        """
+        from PyQt6.QtWidgets import QScrollArea
+        parent = widget.parent()
+        while parent is not None:
+            if isinstance(parent, QScrollArea):
+                parent.ensureWidgetVisible(widget)
+                return
+            parent = parent.parent()
+
     def view_mode(self) -> str:
         return self._view_mode
 

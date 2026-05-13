@@ -135,6 +135,71 @@ def validate(
 
 
 # ---------------------------------------------------------------------------
+# Public partial-validate helpers — used by the GUI's
+# "Validate file" / "Validate folder" toolbar buttons.
+# ---------------------------------------------------------------------------
+
+
+def validate_file(bids_root: Path, file_path: Path) -> FileVerdict:
+    """Run layer-1 per-file checks on a single file and return its verdict.
+
+    Includes:
+    * basename / entity validation against the schema;
+    * sidecar audit for ``.json`` files (required + recommended +
+      optional + deprecated field rollup, TODO placeholder detection).
+
+    Skips layer 2 (``bidsschematools`` structural) — it's a
+    dataset-wide pass that can't sensibly run on a single path in
+    isolation. For full strict validation the user clicks "Validate
+    dataset" with the Strict toggle on.
+
+    ``file_path`` must live under ``bids_root``; raises ``ValueError``
+    otherwise. The returned :class:`FileVerdict.path` is relative to
+    ``bids_root`` so it merges cleanly with a dataset-wide report.
+    """
+    bids_root = Path(bids_root).resolve()
+    file_path = Path(file_path).resolve()
+    rel = file_path.relative_to(bids_root)
+    datatype, suffix = _infer_datatype_suffix(file_path, bids_root)
+    verdict = FileVerdict(path=rel, datatype=datatype, suffix=suffix)
+    _check_filename_entities(file_path, bids_root, datatype, suffix, verdict)
+    if file_path.name.endswith(".json"):
+        _audit_sidecar(file_path, datatype, suffix, bids_root, verdict)
+    return verdict
+
+
+def validate_folder(
+    bids_root: Path,
+    folder_path: Path,
+) -> list[FileVerdict]:
+    """Run :func:`validate_file` on every file under ``folder_path``.
+
+    Walks ``folder_path`` recursively, skipping dotfiles / dot-dirs
+    (``.bidsmgr``, ``.git``, …) the dataset-wide validator also
+    ignores. Returns one :class:`FileVerdict` per file. Like
+    :func:`validate_file`, no dataset-level or folder-level issues are
+    produced — those are reserved for the full dataset pass.
+    """
+    bids_root = Path(bids_root).resolve()
+    folder_path = Path(folder_path).resolve()
+    if not folder_path.is_dir():
+        raise NotADirectoryError(folder_path)
+    out: list[FileVerdict] = []
+    for fp in sorted(folder_path.rglob("*")):
+        if not fp.is_file():
+            continue
+        # Skip anything under a dot-dir (covers .bidsmgr, .git, …).
+        try:
+            rel_parts = fp.relative_to(bids_root).parts
+        except ValueError:
+            continue
+        if any(part.startswith(".") for part in rel_parts):
+            continue
+        out.append(validate_file(bids_root, fp))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Layer 1 — dataset-root checks
 # ---------------------------------------------------------------------------
 

@@ -17,6 +17,7 @@ Future workers (one per CLI verb): ``ConvertWorker``,
 """
 
 from .convert import ConvertWorker
+from .file_report import FileReportWorker, FolderReportWorker
 from .metadata import MetadataWorker
 from .report import ReportWorker
 from .scan import ScanWorker
@@ -24,6 +25,8 @@ from .validate import ValidateWorker
 
 __all__ = [
     "ConvertWorker",
+    "FileReportWorker",
+    "FolderReportWorker",
     "MetadataWorker",
     "ReportWorker",
     "ScanWorker",
