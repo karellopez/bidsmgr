@@ -218,24 +218,25 @@ def _stage_dicoms(source_files, staging_dir: Path) -> int:
         shutil.rmtree(long_path(staging_dir), ignore_errors=False)
     staging_dir.mkdir(parents=True)
     n = 0
-    seen: set[str] = set()
-    for fp in source_files:
+    use_copy_fallback = False
+    for idx, fp in enumerate(source_files):
         src = Path(fp)
         if not src.exists():
             continue
-        # Resolve once to absorb relative paths; preserve filename.
-        link_name = src.name
-        # Disambiguate filename collisions (rare, but possible across
-        # subdirs) by suffixing with a counter.
-        if link_name in seen:
-            stem = src.stem
-            i = 1
-            while f"{stem}_{i}{src.suffix}" in seen:
-                i += 1
-            link_name = f"{stem}_{i}{src.suffix}"
-        seen.add(link_name)
+        # Short sequential names: vendor DICOM filenames are commonly
+        # ~80 chars (full SeriesInstanceUID + instance suffix), which
+        # pushes the full Win32 path past MAX_PATH inside deep staging
+        # trees and makes dcm2niix exit ``rc=2`` without a useful error.
+        # dcm2niix orders frames by DICOM tags (InstanceNumber etc.),
+        # not by filename, so renaming on stage is safe. The zero-padded
+        # counter also makes collision handling unnecessary.
+        link_name = f"{idx:06d}{src.suffix or '.dcm'}"
         link = staging_dir / link_name
         src_resolved = src.resolve()
+        if use_copy_fallback:
+            shutil.copyfile(long_path(src_resolved), long_path(link))
+            n += 1
+            continue
         try:
             os.symlink(long_path(src_resolved), long_path(link))
         except FileExistsError:
@@ -244,9 +245,10 @@ def _stage_dicoms(source_files, staging_dir: Path) -> int:
         except OSError as exc:
             # Windows error 1314: "A required privilege is not held by
             # the client." (SeCreateSymbolicLinkPrivilege missing.)
-            # Fall back to a plain copy so non-admin Windows users
-            # still convert. Other OSErrors propagate so we see them.
+            # Switch this series to copy-mode and stage this file via
+            # plain copy. Other OSErrors propagate so we see them.
             if getattr(exc, "winerror", None) == 1314:
+                use_copy_fallback = True
                 shutil.copyfile(long_path(src_resolved), long_path(link))
             else:
                 raise

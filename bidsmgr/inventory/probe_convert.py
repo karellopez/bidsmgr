@@ -50,6 +50,8 @@ from typing import Iterable, Optional
 
 from joblib import Parallel, delayed
 
+from bidsmgr.util.paths import long_path
+
 from ..classifier.dcm2niix_bidsguess import find_dcm2niix
 from .types import InventoryRow
 
@@ -185,23 +187,52 @@ def _stage_series(
 
     Returns the number of files staged. Existing entries are removed and
     re-linked so re-running the probe is idempotent.
+
+    Windows notes (mirrors ``dcm2niix_direct._stage_dicoms``):
+
+    * ``os.symlink`` requires ``SeCreateSymbolicLinkPrivilege`` (granted
+      by Developer Mode) or Administrator on Windows. When the syscall
+      fails with ``WinError 1314`` this function switches the rest of
+      the series to ``shutil.copyfile`` so non-admin Windows users still
+      get a working probe pass.
+    * Staged filenames are short, zero-padded sequential names rather
+      than the source name. Vendor Siemens/GE DICOMs are ~80 chars and
+      easily push the full Win32 path past the 260-char ``MAX_PATH``
+      ceiling inside a deep staging tree, which makes dcm2niix exit
+      ``rc=2`` without a useful error. dcm2niix orders frames by DICOM
+      tags (InstanceNumber etc.), not by filename, so renaming on stage
+      is safe and removes the need for collision handling.
     """
 
     if staging_dir.exists():
-        shutil.rmtree(staging_dir)
+        shutil.rmtree(long_path(staging_dir), ignore_errors=False)
     staging_dir.mkdir(parents=True)
     n = 0
-    for fp in file_paths:
+    use_copy_fallback = False
+    for idx, fp in enumerate(file_paths):
         src = Path(fp)
         if not src.exists():
             continue
-        link = staging_dir / src.name
-        # Use absolute symlinks so the staging dir can be moved / inspected.
+        link_name = f"{idx:06d}{src.suffix or '.dcm'}"
+        link = staging_dir / link_name
+        src_resolved = src.resolve()
+        if use_copy_fallback:
+            shutil.copyfile(long_path(src_resolved), long_path(link))
+            n += 1
+            continue
         try:
-            os.symlink(src.resolve(), link)
+            os.symlink(long_path(src_resolved), long_path(link))
         except FileExistsError:
-            link.unlink()
-            os.symlink(src.resolve(), link)
+            os.unlink(long_path(link))
+            os.symlink(long_path(src_resolved), long_path(link))
+        except OSError as exc:
+            # WinError 1314: SeCreateSymbolicLinkPrivilege missing.
+            # Switch to copy-mode for the rest of this series.
+            if getattr(exc, "winerror", None) == 1314:
+                use_copy_fallback = True
+                shutil.copyfile(long_path(src_resolved), long_path(link))
+            else:
+                raise
         n += 1
     return n
 

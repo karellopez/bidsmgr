@@ -305,6 +305,18 @@ def _convert_subject(
                         "sub-%s task %s failed: %s",
                         subject, r.task.basename, r.error,
                     )
+                    # The dcm2niix stderr tail is captured on the result
+                    # but useless if never logged — surface it so the
+                    # failure is actionable without digging through the
+                    # JSON error log. ``rc=2`` is generic; the tail is
+                    # what tells you "MAX_PATH overflow" vs "bad header"
+                    # vs "no DICOMs found".
+                    tail = (r.dcm2niix_stderr_tail or "").strip()
+                    if tail:
+                        log.warning(
+                            "sub-%s task %s dcm2niix stderr (tail):\n%s",
+                            subject, r.task.basename, tail,
+                        )
 
 
 def _phase1_parallel_dcm2niix(

@@ -326,8 +326,11 @@ class TestStageDicoms:
 
         n = _stage_dicoms(files, staging)
         assert n == 4
+        # Staging renames each input to a zero-padded sequential name so
+        # deep Windows paths stay under MAX_PATH; dcm2niix orders frames
+        # by DICOM tags, not by filename, so this is safe.
         assert sorted(p.name for p in staging.iterdir()) == [
-            "IMG0000.dcm", "IMG0001.dcm", "IMG0002.dcm", "IMG0003.dcm",
+            "000000.dcm", "000001.dcm", "000002.dcm", "000003.dcm",
         ]
         # Each entry is a symlink resolving back to the source.
         for p in staging.iterdir():
