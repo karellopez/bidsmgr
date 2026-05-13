@@ -53,7 +53,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
     # Import Qt + GUI lazily so the ``--help`` path doesn't require
-    # PyQt to be available.
+    # PyQt to be available. On Linux, make sure libxcb-cursor0 is
+    # reachable (Qt 6.5+ refuses to load the xcb plugin without it).
+    from .util.qt_platform import prepare as _prepare_qt_platform
+    _prepare_qt_platform()
+
     from PyQt6.QtWidgets import QApplication
 
     from .gui.main_window import MainWindow
