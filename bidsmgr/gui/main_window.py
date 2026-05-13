@@ -39,14 +39,40 @@ from .theme_manager import ThemeManager
 log = logging.getLogger(__name__)
 
 
+class _ClickableLabel(QLabel):
+    """A QLabel that emits :pyattr:`clicked` on a left-click release.
+
+    Used for the brand logo + wordmark in :class:`_TopHeader` — both
+    open the About dialog when clicked. Cursor flips to a pointing
+    hand so it reads as an actionable element.
+    """
+
+    clicked = pyqtSignal()
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 — Qt naming
+        if event.button() == Qt.MouseButton.LeftButton \
+                and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
 class _TopHeader(QFrame):
     """Brand header with a Converter/Editor pill switcher and theme toggle.
 
     Mirrors ``inspector_proto/proto.py``'s ``TopHeader``: brand on the
     left, two checkable view pills, theme toggle on the right.
+
+    The brand logo and wordmark are clickable — emit
+    :pyattr:`about_requested` so :class:`MainWindow` can pop the
+    :class:`AboutDialog`.
     """
 
     view_changed = pyqtSignal(str)  # "converter" | "editor"
+    about_requested = pyqtSignal()
 
     def __init__(self, theme: ThemeManager, parent=None) -> None:
         super().__init__(parent)
@@ -59,13 +85,18 @@ class _TopHeader(QFrame):
         # Brand logo + name. The bundled PNG ships in
         # ``bidsmgr/gui/assets/logo.png``; we fall back to a gradient-B
         # placeholder if the asset can't be loaded for any reason
-        # (e.g. running from a partial source tree).
-        self._logo = QLabel()
+        # (e.g. running from a partial source tree). Both the logo and
+        # the wordmark are clickable — they pop the About dialog.
+        self._logo = _ClickableLabel()
         self._logo.setFixedSize(28, 24)
         self._logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._logo.setToolTip("About BIDS-Manager")
+        self._logo.clicked.connect(self.about_requested.emit)
         self._apply_logo_pixmap(theme.palette)
-        name = QLabel("BIDS-Manager")
+        name = _ClickableLabel("BIDS-Manager")
         name.setObjectName("brand-name")
+        name.setToolTip("About BIDS-Manager")
+        name.clicked.connect(self.about_requested.emit)
         h.addWidget(self._logo)
         h.addWidget(name)
         h.addSpacing(12)
@@ -205,6 +236,7 @@ class MainWindow(QMainWindow):
         v.addWidget(self.stack, 1)
 
         self._header.view_changed.connect(self._on_view_changed)
+        self._header.about_requested.connect(self._show_about_dialog)
 
         # Restore the user's last view. Pills are syncronised silently
         # so we don't fire a redundant ``view_changed`` on startup.
@@ -237,6 +269,11 @@ class MainWindow(QMainWindow):
 
     def _on_view_changed(self, view: str) -> None:
         self._apply_active_view(view, persist=True)
+
+    def _show_about_dialog(self) -> None:
+        """Pop the About / Authorship dialog from the brand click."""
+        from .about_dialog import AboutDialog
+        AboutDialog(self).exec()
 
     def _apply_active_view(self, view: str, *, persist: bool) -> None:
         """Switch the stacked widget and (optionally) persist the choice."""

@@ -367,7 +367,10 @@ class ConverterPanel(QWidget):
 
         # Toggle: highlight suspected-abort rows with a purple tint.
         # Aborts are already auto-deselected by the scanner; highlighting
-        # them lets the user eyeball where they sit in the table.
+        # Highlight aborts + Bulk edit buttons are constructed here so
+        # they're available before _build_inspection_pane runs, but
+        # they're added to the inspection pane's footer (closer to the
+        # table they act on), not to this toolbar.
         self._aborts_btn = QPushButton("⌬  Highlight aborts")
         self._aborts_btn.setObjectName("tb-btn-toggle")
         self._aborts_btn.setCheckable(True)
@@ -379,11 +382,7 @@ class ConverterPanel(QWidget):
             "overlay just makes them easy to spot."
         )
         self._aborts_btn.toggled.connect(self._on_aborts_toggled)
-        lay.addWidget(self._aborts_btn)
 
-        # Bulk edit — enabled once the user has ≥ 2 rows selected in the
-        # inspection table. Sits at the very right edge of the chip
-        # cluster so it reads as "for this selection, ..."
         self._bulk_btn = QPushButton("✎  Bulk edit…")
         self._bulk_btn.setObjectName("tb-btn")
         self._bulk_btn.setEnabled(False)
@@ -393,7 +392,6 @@ class ConverterPanel(QWidget):
             "entities + basenames in step."
         )
         self._bulk_btn.clicked.connect(self._on_bulk_edit_clicked)
-        lay.addWidget(self._bulk_btn)
 
         # Busy spinner + status message — visible only while a worker
         # is running. Lives in the centre of the toolbar so it's hard
@@ -460,6 +458,21 @@ class ConverterPanel(QWidget):
         self._inspection_stack.addWidget(self._table)
 
         v.addWidget(self._inspection_stack, 1)
+
+        # Footer: per-pane controls that act on the table's selection.
+        # "Highlight aborts" toggles row-tint on the model;
+        # "Bulk edit…" enables once ≥ 2 rows are selected. Previously
+        # both lived on the converter toolbar — moving them next to the
+        # table puts them closer to the rows they affect.
+        footer = QFrame()
+        footer.setObjectName("inspection-footer")
+        fl = QHBoxLayout(footer)
+        fl.setContentsMargins(10, 6, 10, 6)
+        fl.setSpacing(8)
+        fl.addWidget(self._aborts_btn)
+        fl.addStretch(1)
+        fl.addWidget(self._bulk_btn)
+        v.addWidget(footer)
         return pane
 
     def _build_table(self) -> QTableView:

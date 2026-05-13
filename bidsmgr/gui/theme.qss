@@ -621,6 +621,74 @@ QFrame#sidecar-footer {
     background: $surface2;
     border-top: 1px solid $subtle;
 }
+
+/* Footer strip at the bottom of the Converter's Inspection pane,
+   holding the per-pane Highlight aborts + Bulk edit buttons. Same
+   chrome as the sidecar footer so the theme follows. */
+QFrame#inspection-footer {
+    background: $surface2;
+    border-top: 1px solid $subtle;
+}
+
+/* About / Authorship dialog. */
+QDialog#about-dialog {
+    background: $bg;
+}
+QScrollArea#about-scroll { background: $bg; border: none; }
+QWidget#about-body { background: $bg; }
+QLabel#about-title {
+    color: $text;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+QLabel#about-version {
+    color: $dim;
+    font-size: 12px;
+}
+QLabel#about-intro {
+    color: $text;
+    font-size: 13px;
+}
+QLabel#about-lab-desc {
+    color: $dim;
+    font-size: 12px;
+}
+QLabel#about-section-header {
+    color: $accent;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+QFrame#about-divider {
+    background: $subtle;
+    max-height: 1px;
+    border: none;
+}
+QFrame#about-author-row { background: transparent; }
+QLabel#about-author-pic {
+    border: 1px solid $border;
+    border-radius: 6px;
+    padding: 2px;
+}
+QLabel#about-author-bio {
+    color: $text;
+    font-size: 12px;
+}
+QLabel#about-ack {
+    color: $dim;
+    font-size: 12px;
+    line-height: 1.6em;
+}
+QLabel#about-links {
+    color: $accent;
+    font-size: 11px;
+}
+QFrame#about-footer {
+    background: $surface2;
+    border-top: 1px solid $subtle;
+}
 QLabel#sidecar-footer-path {
     color: $dim;
     font-family: "SF Mono","Menlo","Monaco",monospace;

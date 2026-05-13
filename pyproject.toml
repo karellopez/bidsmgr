@@ -95,7 +95,7 @@ packages = [
 include-package-data = true
 
 [tool.setuptools.package-data]
-"bidsmgr.gui" = ["*.qss", "assets/*.png"]
+"bidsmgr.gui" = ["*.qss", "assets/*.png", "assets/*.jpg", "assets/*.jpeg"]
 "bidsmgr.schema" = ["bundled/**/*"]
 
 [tool.pytest.ini_options]
