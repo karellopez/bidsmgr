@@ -29,6 +29,10 @@ KEYS = {
     "dataset_slug":       "scan/dataset_slug",       # default dataset name
     "scan_tsv_filename":  "scan/tsv_filename",       # filename of the scan TSV
     "highlight_aborts":   "inspector/highlight_aborts",   # toolbar toggle
+    "active_view":        "ui/active_view",          # "converter" | "editor"
+    "editor_bids_root":   "editor/bids_root",        # last BIDS root opened in the Editor view
+    "editor_sidecar_view": "editor/sidecar_view",    # "bids" | "tree"
+    "editor_strict_validate": "editor/strict_validate",  # layer 2 (bidsschematools) on/off
     # Scan defaults
     "scan_n_jobs":        "scan/n_jobs",
     "scan_probe_convert": "scan/probe_convert",
@@ -58,6 +62,17 @@ class AppSettings:
 
     # UI
     theme: str = "dark"
+    # Which top-level view is shown on launch. Persisted across runs so
+    # users land on the pane they were last using.
+    active_view: str = "converter"
+    # Last BIDS root opened in the Editor view (post-convert browser).
+    editor_bids_root: Optional[str] = None
+    # Which sidecar pane layout is active for JSON files.
+    editor_sidecar_view: str = "bids"  # "bids" | "tree"
+    # When True, "Validate dataset" runs ``bidsschematools.validator``
+    # (the official Python BIDS validator) in addition to bidsmgr's
+    # schema-driven layer 1 checks.
+    editor_strict_validate: bool = False
 
     # Recently-used paths (paths come back as str; callers wrap in Path).
     raw_root: Optional[str] = None
@@ -128,6 +143,19 @@ class AppSettings:
         out.theme = _as_str(s.value(KEYS["theme"]), out.theme)
         if out.theme not in ("dark", "light"):
             out.theme = "dark"
+        out.active_view = _as_str(s.value(KEYS["active_view"]), out.active_view)
+        if out.active_view not in ("converter", "editor"):
+            out.active_view = "converter"
+        out.editor_bids_root = s.value(KEYS["editor_bids_root"]) or None
+        out.editor_sidecar_view = _as_str(
+            s.value(KEYS["editor_sidecar_view"]), out.editor_sidecar_view,
+        )
+        if out.editor_sidecar_view not in ("bids", "tree"):
+            out.editor_sidecar_view = "bids"
+        out.editor_strict_validate = _as_bool(
+            s.value(KEYS["editor_strict_validate"]),
+            out.editor_strict_validate,
+        )
         out.raw_root = s.value(KEYS["raw_root"]) or None
         out.bids_parent = s.value(KEYS["bids_parent"]) or None
         out.dataset_slug = _as_str(s.value(KEYS["dataset_slug"]), out.dataset_slug)
@@ -188,6 +216,7 @@ class AppSettings:
             ("post_metadata_fill_todos", self.post_metadata_fill_todos),
             ("post_validate_strict",     self.post_validate_strict),
             ("post_validate_html",       self.post_validate_html),
+            ("editor_strict_validate",   self.editor_strict_validate),
         ):
             s.setValue(KEYS[key], "1" if val else "0")
         s.sync()
@@ -222,6 +251,24 @@ class AppSettings:
     @classmethod
     def remember_theme(cls, theme: str) -> None:
         cls._settings().setValue(KEYS["theme"], theme)
+
+    @classmethod
+    def remember_active_view(cls, view: str) -> None:
+        cls._settings().setValue(KEYS["active_view"], view)
+
+    @classmethod
+    def remember_editor_bids_root(cls, path: Path) -> None:
+        cls._settings().setValue(KEYS["editor_bids_root"], str(path))
+
+    @classmethod
+    def remember_editor_sidecar_view(cls, view: str) -> None:
+        cls._settings().setValue(KEYS["editor_sidecar_view"], view)
+
+    @classmethod
+    def remember_editor_strict_validate(cls, enabled: bool) -> None:
+        cls._settings().setValue(
+            KEYS["editor_strict_validate"], "1" if enabled else "0",
+        )
 
 
 __all__ = ["AppSettings", "KEYS"]

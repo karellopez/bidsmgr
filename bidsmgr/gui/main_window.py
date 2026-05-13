@@ -14,15 +14,17 @@ from typing import Optional
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPushButton,
+    QStackedWidget,
     QStatusBar,
     QTreeWidget,
     QVBoxLayout,
@@ -31,19 +33,20 @@ from PyQt6.QtWidgets import (
 
 from ..project import Project
 from .converter_panel import ConverterPanel
+from .editor_panel import EditorPanel
 from .theme_manager import ThemeManager
 
 log = logging.getLogger(__name__)
 
 
 class _TopHeader(QFrame):
-    """Tiny brand header with a theme-toggle button.
+    """Brand header with a Converter/Editor pill switcher and theme toggle.
 
-    Stripped-down version of ``inspector_proto/proto.py``'s
-    ``TopHeader``: the view-switcher (Converter / Editor pills) lands
-    when the Editor view does (M6), so for the CLI launch we just
-    show the brand + the dark/light toggle.
+    Mirrors ``inspector_proto/proto.py``'s ``TopHeader``: brand on the
+    left, two checkable view pills, theme toggle on the right.
     """
+
+    view_changed = pyqtSignal(str)  # "converter" | "editor"
 
     def __init__(self, theme: ThemeManager, parent=None) -> None:
         super().__init__(parent)
@@ -65,6 +68,26 @@ class _TopHeader(QFrame):
         name.setObjectName("brand-name")
         h.addWidget(self._logo)
         h.addWidget(name)
+        h.addSpacing(12)
+
+        # View pills — Converter | Editor. The button group keeps the
+        # two checkable buttons mutually exclusive; ``idClicked`` fires
+        # whichever was just selected so we can re-emit a typed signal.
+        self._converter_btn = QPushButton("Converter")
+        self._converter_btn.setObjectName("view-pill")
+        self._converter_btn.setCheckable(True)
+        self._converter_btn.setChecked(True)
+        self._editor_btn = QPushButton("Editor")
+        self._editor_btn.setObjectName("view-pill")
+        self._editor_btn.setCheckable(True)
+        self._pill_group = QButtonGroup(self)
+        self._pill_group.setExclusive(True)
+        self._pill_group.addButton(self._converter_btn, 0)
+        self._pill_group.addButton(self._editor_btn, 1)
+        self._pill_group.idClicked.connect(self._on_pill_clicked)
+        h.addWidget(self._converter_btn)
+        h.addWidget(self._editor_btn)
+
         h.addStretch(1)
 
         self._theme = theme
@@ -74,6 +97,14 @@ class _TopHeader(QFrame):
         self._theme_btn.setFixedSize(32, 28)
         self._theme_btn.clicked.connect(self._on_toggle)
         h.addWidget(self._theme_btn)
+
+    def set_active_view(self, view: str) -> None:
+        """Programmatically toggle the pills (no signal emitted)."""
+        target = self._editor_btn if view == "editor" else self._converter_btn
+        target.setChecked(True)
+
+    def _on_pill_clicked(self, idx: int) -> None:
+        self.view_changed.emit("editor" if idx == 1 else "converter")
 
     def _on_toggle(self) -> None:
         from .app_settings import AppSettings
@@ -162,8 +193,24 @@ class MainWindow(QMainWindow):
         self._header = _TopHeader(theme)
         v.addWidget(self._header)
 
+        # Stacked content — Converter and Editor share the window and
+        # are swapped via the header pills. The stack keeps both alive
+        # so theme listeners stay registered and panel state survives
+        # switching back and forth.
+        self.stack = QStackedWidget()
         self.converter = ConverterPanel(project=project)
-        v.addWidget(self.converter, 1)
+        self.editor = EditorPanel()
+        self.stack.addWidget(self.converter)   # index 0 → "converter"
+        self.stack.addWidget(self.editor)      # index 1 → "editor"
+        v.addWidget(self.stack, 1)
+
+        self._header.view_changed.connect(self._on_view_changed)
+
+        # Restore the user's last view. Pills are syncronised silently
+        # so we don't fire a redundant ``view_changed`` on startup.
+        from .app_settings import AppSettings
+        settings = AppSettings.load()
+        self._apply_active_view(settings.active_view, persist=False)
 
         # Status bar — forwards the Converter's log messages so the
         # user sees scan / convert progress.
@@ -174,6 +221,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(sb)
 
         self.converter.log_message.connect(self._set_status)
+        self.editor.log_message.connect(self._set_status)
 
         # Subscribe to palette changes so widgets whose colors are read
         # at construction time (delegate paints, inline ``setStyleSheet``)
@@ -187,6 +235,19 @@ class MainWindow(QMainWindow):
         # we just make sure the header icon matches.
         self._header._theme_btn.setText("☀" if theme == "dark" else "☾")
 
+    def _on_view_changed(self, view: str) -> None:
+        self._apply_active_view(view, persist=True)
+
+    def _apply_active_view(self, view: str, *, persist: bool) -> None:
+        """Switch the stacked widget and (optionally) persist the choice."""
+        if view not in ("converter", "editor"):
+            view = "converter"
+        self.stack.setCurrentIndex(1 if view == "editor" else 0)
+        self._header.set_active_view(view)
+        if persist:
+            from .app_settings import AppSettings
+            AppSettings.remember_active_view(view)
+
     def _on_palette_changed(self, pal: dict) -> None:
         """Re-render every widget that holds palette-baked styling.
 
@@ -199,9 +260,11 @@ class MainWindow(QMainWindow):
         """
         # Brand logo gradient — rebuilt from the new palette.
         self._header.repaint_for_palette(pal)
-        # Cascade into the Converter panel.
+        # Cascade into the Converter and Editor panels.
         if hasattr(self, "converter"):
             self.converter.repaint_for_palette(pal)
+        if hasattr(self, "editor"):
+            self.editor.repaint_for_palette(pal)
         # Force a viewport repaint on every delegate-driven view in
         # the window so cells / badges / row tints pick up new colors.
         for view in self.findChildren(QAbstractItemView):

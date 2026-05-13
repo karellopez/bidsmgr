@@ -13,8 +13,13 @@ Public surface — every widget the Converter and Editor views compose:
 Lift-and-shift from ``inspector_proto/proto.py``; no logic change.
 """
 
+from .bids_tree_pane import BidsTreePane
+from .json_tree_view import JsonTreeView
 from .primitives import Chip, PaneHeader, PathBar, VSep
+from .sidecar_form_pane import SidecarFormPane, find_peer_files
 from .sidecar_row import SidecarRow
+from .tsv_viewer_pane import TsvViewerPane
+from .validation_pane import ValidationPane
 from .spinner import BusySpinner
 from .status_badge import (
     KIND_BG_TOKEN,
@@ -26,14 +31,20 @@ from .status_badge import (
 from .val_message import ValMessage
 
 __all__ = [
+    "BidsTreePane",
     "BusySpinner",
     "Chip",
+    "JsonTreeView",
     "KIND_BG_TOKEN",
     "KIND_CHAR",
     "KIND_FG_TOKEN",
     "PaneHeader",
     "PathBar",
+    "SidecarFormPane",
     "SidecarRow",
+    "TsvViewerPane",
+    "ValidationPane",
+    "find_peer_files",
     "StatusBadge",
     "ValMessage",
     "VSep",

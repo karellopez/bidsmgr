@@ -56,6 +56,8 @@ DARK: dict[str, str] = {
     'purple':     '#d2a8ff',
     'teal':       '#39c5cf',
 
+    'muted_40':        'rgba(101,109,118,0.40)',
+
     'accent_bg':       'rgba(88,166,255,0.12)',
     'accent_border':   'rgba(88,166,255,0.40)',
     'success_bg':      'rgba(63,185,80,0.12)',
@@ -89,6 +91,8 @@ LIGHT: dict[str, str] = {
     'error':      '#cf222e',
     'purple':     '#8250df',
     'teal':       '#1d7a8c',
+
+    'muted_40':        'rgba(140,149,159,0.40)',
 
     'accent_bg':       'rgba(9,105,218,0.08)',
     'accent_border':   'rgba(9,105,218,0.32)',

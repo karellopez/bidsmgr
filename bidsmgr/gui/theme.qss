@@ -377,6 +377,24 @@ QTableView#inv-table::item {
 }
 QTableView#inv-table::item:selected { background: $accent_bg; }
 
+/* Editor TSV viewer (read-only) — same chrome as the converter's
+   inspection table so the theme follows automatically. */
+QTableView#tsv-view {
+    background: $bg;
+    alternate-background-color: $surface;
+    color: $text;
+    border: none;
+    gridline-color: $subtle;
+    selection-background-color: $accent_bg;
+    selection-color: $text;
+    font-size: 11px;
+}
+QTableView#tsv-view::item {
+    padding: 4px 8px;
+    border-bottom: 1px solid $subtle;
+}
+QTableView#tsv-view::item:selected { background: $accent_bg; }
+
 QHeaderView::section {
     background: $surface;
     color: $muted;
@@ -568,6 +586,50 @@ QLabel#sc-key-dep  { color: $muted; font-family: "SF Mono","Menlo","Monaco",mono
 QLabel#sc-val-str { color: $accent; font-family: "SF Mono","Menlo","Monaco",monospace; font-size: 11px; }
 QLabel#sc-val-num { color: $purple; font-family: "SF Mono","Menlo","Monaco",monospace; font-size: 11px; }
 QLabel#sc-val-todo { color: $error; font-family: "SF Mono","Menlo","Monaco",monospace; font-size: 11px; font-style: italic; }
+
+/* SidecarRow 4px level bar — colors come from the palette tokens so a
+   theme swap is just an app-wide QSS re-apply, exactly like
+   ``#dock-log``. No per-widget repaint listener needed. */
+QFrame#sc-bar-req { background: $error; }
+QFrame#sc-bar-rec { background: $warning; }
+QFrame#sc-bar-opt { background: $muted_40; }
+QFrame#sc-bar-dep { background: $muted; }
+
+/* Schema-legend swatches — same QSS-only pattern. */
+QFrame#legend-swatch-req { background: $error;    border-radius: 2px; }
+QFrame#legend-swatch-rec { background: $warning;  border-radius: 2px; }
+QFrame#legend-swatch-opt { background: $muted_40; border-radius: 2px; }
+QFrame#legend-swatch-dep { background: $muted;    border-radius: 2px; }
+
+/* SidecarFormPane edit toolbar (Save / Revert + dirty chip). */
+QFrame#sidecar-toolbar {
+    background: $surface2;
+    border-bottom: 1px solid $subtle;
+}
+QLabel#sidecar-dirty-chip {
+    background: $warning_bg;
+    color: $warning;
+    border: 1px solid $warning_border;
+    border-radius: 8px;
+    padding: 1px 8px;
+    font-size: 10px;
+    font-weight: 600;
+}
+
+/* SidecarFormPane status footer. */
+QFrame#sidecar-footer {
+    background: $surface2;
+    border-top: 1px solid $subtle;
+}
+QLabel#sidecar-footer-path {
+    color: $dim;
+    font-family: "SF Mono","Menlo","Monaco",monospace;
+    font-size: 10px;
+}
+QLabel#sidecar-footer-summary {
+    color: $dim;
+    font-size: 10px;
+}
 
 /* ---------- Editor: validation panel ---------- */
 QWidget#val-panel { background: $surface; }

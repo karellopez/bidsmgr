@@ -18,12 +18,14 @@ Future workers (one per CLI verb): ``ConvertWorker``,
 
 from .convert import ConvertWorker
 from .metadata import MetadataWorker
+from .report import ReportWorker
 from .scan import ScanWorker
 from .validate import ValidateWorker
 
 __all__ = [
     "ConvertWorker",
     "MetadataWorker",
+    "ReportWorker",
     "ScanWorker",
     "ValidateWorker",
 ]
