@@ -386,8 +386,14 @@ def test_tree_click_loads_form_without_validation(
 def test_tree_click_only_opens_clicked_file(
     qapp, isolated_settings, bids_root: Path,
 ) -> None:
-    """The pane shows only the file the user clicked — no auto-opened
-    peers (no tab strip, no peer signals)."""
+    """The center pane shows only the file the user clicked — no
+    auto-opened peers (no tab strip, no peer signals).
+
+    Since the NIfTI viewer landed, clicking a ``.nii.gz`` routes to
+    :class:`NiftiViewerPane` instead of binding the sidecar form to
+    the volume. The "no peer auto-loaded" invariant still holds — the
+    sibling JSON stays untouched.
+    """
     panel = EditorPanel()
     panel._set_root(bids_root, persist=False)
 
@@ -396,8 +402,12 @@ def test_tree_click_only_opens_clicked_file(
     )
     panel._on_file_selected(nii_path)
 
-    # The clicked file is bound; its sibling .json is NOT auto-loaded.
-    assert panel._sidecar_form.current_file() == nii_path
+    # NIfTI clicks land on the NIfTI viewer; the sidecar form is
+    # cleared so its previous binding doesn't leak.
+    assert panel._center_stack.currentWidget() is panel._nifti_viewer
+    assert panel._sidecar_form.current_file() is None
+    # The sibling .json is NOT auto-loaded into the form.
+    assert panel._sidecar_form._rows == []
     # And no SidecarFormPane peer-tab API survives.
     assert not hasattr(panel._sidecar_form, "_tab_buttons")
 

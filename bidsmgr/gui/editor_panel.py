@@ -40,6 +40,7 @@ from .widgets import (
     BidsTreePane,
     BusySpinner,
     Chip,
+    NiftiViewerPane,
     PaneHeader,
     PathBar,
     SidecarFormPane,
@@ -97,12 +98,14 @@ class EditorPanel(QWidget):
         # Center pane is itself a stack — different viewer per file
         # kind. Index 0 = JSON sidecar (default for unsupported kinds
         # too — its empty-state hint guides the user to the JSON peer).
-        # Index 1 = TSV table.
+        # Index 1 = TSV table. Index 2 = NIfTI 2-D slice viewer.
         self._sidecar_form = SidecarFormPane()
         self._tsv_viewer = TsvViewerPane()
+        self._nifti_viewer = NiftiViewerPane()
         self._center_stack = QStackedWidget()
         self._center_stack.addWidget(self._sidecar_form)
         self._center_stack.addWidget(self._tsv_viewer)
+        self._center_stack.addWidget(self._nifti_viewer)
         self._validation_pane = ValidationPane()
         self._validation_pane.fix_requested.connect(self._on_fix_requested)
         self._splitter.addWidget(self._tree_pane)
@@ -336,6 +339,7 @@ class EditorPanel(QWidget):
         self._report = None
         self._sidecar_form.set_file(None, None, None)
         self._tsv_viewer.set_file(None, None)
+        self._nifti_viewer.set_file(None, None)
         self._center_stack.setCurrentWidget(self._sidecar_form)
         self._validation_pane.set_report(None)
         self._validation_pane.set_current_file(None, None)
@@ -539,10 +543,12 @@ class EditorPanel(QWidget):
         Routes to a viewer based on the file extension:
 
         * ``.tsv`` / ``.tsv.gz`` → :class:`TsvViewerPane` (table).
-        * everything else (JSON sidecars, NIfTI, EEG/MEG, …) →
+        * ``.nii`` / ``.nii.gz`` → :class:`NiftiViewerPane` (2-D slice
+          viewer with orientation buttons + brightness/contrast).
+        * everything else (JSON sidecars, EEG/MEG, …) →
           :class:`SidecarFormPane`. The sidecar pane shows the form
           for JSON and a "no sidecar form for this file type" hint
-          for other kinds (NIfTI / MEG / EEG viewers are future work).
+          for other kinds (MEG / EEG viewers are future work).
         """
         if path.is_dir():
             # Directories don't carry sidecars. We still push the
@@ -550,6 +556,7 @@ class EditorPanel(QWidget):
             # section can reflect the user's focus.
             self._sidecar_form.set_file(None, None, None)
             self._tsv_viewer.set_file(None, None)
+            self._nifti_viewer.set_file(None, None)
             self._center_stack.setCurrentWidget(self._sidecar_form)
             self._validation_pane.set_current_file(path, self.current_root())
             return
@@ -557,13 +564,20 @@ class EditorPanel(QWidget):
         root = self.current_root()
         if name.endswith(".tsv") or name.endswith(".tsv.gz"):
             self._tsv_viewer.set_file(path, root)
-            # Sidecar pane is cleared so a future toggle back doesn't
-            # show stale JSON-form state for a different file.
+            # Other panes get cleared so a future toggle back doesn't
+            # show stale state for a different file.
             self._sidecar_form.set_file(None, None, None)
+            self._nifti_viewer.set_file(None, None)
             self._center_stack.setCurrentWidget(self._tsv_viewer)
+        elif name.endswith(".nii") or name.endswith(".nii.gz"):
+            self._nifti_viewer.set_file(path, root)
+            self._sidecar_form.set_file(None, None, None)
+            self._tsv_viewer.set_file(None, None)
+            self._center_stack.setCurrentWidget(self._nifti_viewer)
         else:
             self._sidecar_form.set_file(path, root, self._report)
             self._tsv_viewer.set_file(None, None)
+            self._nifti_viewer.set_file(None, None)
             self._center_stack.setCurrentWidget(self._sidecar_form)
         self._validation_pane.set_current_file(path, root)
 
@@ -637,6 +651,7 @@ class EditorPanel(QWidget):
         self._tree_pane.repaint_for_palette(pal)
         self._sidecar_form.repaint_for_palette(pal)
         self._tsv_viewer.repaint_for_palette(pal)
+        self._nifti_viewer.repaint_for_palette(pal)
         self._validation_pane.repaint_for_palette(pal)
 
 

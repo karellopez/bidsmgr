@@ -33,6 +33,8 @@ KEYS = {
     "editor_bids_root":   "editor/bids_root",        # last BIDS root opened in the Editor view
     "editor_sidecar_view": "editor/sidecar_view",    # "bids" | "tree"
     "editor_strict_validate": "editor/strict_validate",  # layer 2 (bidsschematools) on/off
+    "nifti_crosshair_color": "editor/nifti_crosshair_color",   # hex string e.g. "#4FC3F7"
+    "nifti_crosshair_thickness": "editor/nifti_crosshair_thickness",  # px, 1..5
     # Scan defaults
     "scan_n_jobs":        "scan/n_jobs",
     "scan_probe_convert": "scan/probe_convert",
@@ -73,6 +75,10 @@ class AppSettings:
     # (the official Python BIDS validator) in addition to bidsmgr's
     # schema-driven layer 1 checks.
     editor_strict_validate: bool = False
+    # NIfTI viewer crosshair style. Persisted so the user's chosen
+    # colour + thickness survives across sessions.
+    nifti_crosshair_color: str = "#4FC3F7"
+    nifti_crosshair_thickness: int = 1
 
     # Recently-used paths (paths come back as str; callers wrap in Path).
     raw_root: Optional[str] = None
@@ -155,6 +161,17 @@ class AppSettings:
         out.editor_strict_validate = _as_bool(
             s.value(KEYS["editor_strict_validate"]),
             out.editor_strict_validate,
+        )
+        out.nifti_crosshair_color = _as_str(
+            s.value(KEYS["nifti_crosshair_color"]),
+            out.nifti_crosshair_color,
+        )
+        out.nifti_crosshair_thickness = _as_int(
+            s.value(KEYS["nifti_crosshair_thickness"]),
+            out.nifti_crosshair_thickness,
+        )
+        out.nifti_crosshair_thickness = max(
+            1, min(out.nifti_crosshair_thickness, 5),
         )
         out.raw_root = s.value(KEYS["raw_root"]) or None
         out.bids_parent = s.value(KEYS["bids_parent"]) or None
@@ -268,6 +285,15 @@ class AppSettings:
     def remember_editor_strict_validate(cls, enabled: bool) -> None:
         cls._settings().setValue(
             KEYS["editor_strict_validate"], "1" if enabled else "0",
+        )
+
+    @classmethod
+    def remember_nifti_crosshair(cls, color: str, thickness: int) -> None:
+        s = cls._settings()
+        s.setValue(KEYS["nifti_crosshair_color"], str(color))
+        s.setValue(
+            KEYS["nifti_crosshair_thickness"],
+            int(max(1, min(thickness, 5))),
         )
 
 
